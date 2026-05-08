@@ -2,15 +2,16 @@
 
 A Python CLI demo of a Payment Token semantic layer (SL) running on EON
 Protocol. It models a centralized-issuer stablecoin (USDC model) with four
-distinct actors interacting through simulated on-chain storage.
+distinct actors and a devnet-oriented data-availability boundary.
 
     State Machine:  S_{i+1} = F(S_i, Input_i)
     Prf3 Strategy:  Path (a) — post raw inputs + state hashes, verifiers re-execute
-    Base Layer:     UTXO Data payload (simulated as JSON block files)
+    Base Layer:     EON devnet UTXO Data payload
 
-The local demo keeps the SL mechanics easy to inspect. The EON devnet version
-replaces `base_layer/block_NNN.json` with a data-bearing EON UTXO submitted
-through `eoncli` / the SDK.
+The repo currently includes an offline CLI harness so the SL mechanics are easy
+to inspect. The intended internal demo should use EON devnet as the data
+availability layer: the operator posts each canonical batch payload into a
+data-bearing EON UTXO through `eoncli` / the SDK.
 
 ## Actors
 
@@ -18,9 +19,10 @@ through `eoncli` / the SDK.
 | ------------ | ------------- | ------------------------------------------------------------------------ |
 | Issuer       | `issuer.py`   | Authority VK. Queues mint / burn / freeze / unfreeze actions.            |
 | Wallet       | `wallet.py`   | End user (Alice, Bob, Charlie). Queues transfers.                        |
-| Operator     | `sl_operator.py` | Runs F(), batches pending actions, posts blocks to the base layer.       |
+| Operator     | `sl_operator.py` | Runs F(), batches pending actions, posts canonical payloads.             |
 | Verifier     | `verifier.py` | Trust-minimized. Re-executes blocks and checks state-hash commitments.   |
-| Base layer   | `base_layer/` | Dumb storage. Simulates UTXO Data availability. Operator writes, everyone reads. |
+| EON devnet   | `eoncli` / SDK | Orders transactions and stores retrievable UTXO `Data`.                 |
+| Offline harness | `base_layer/` | Optional local stand-in used by the CLI walkthrough only.              |
 
 ## Layout
 
@@ -29,9 +31,9 @@ payment_sl/
 ├── core.py           # state machine (F), actions, payload serialization
 ├── issuer.py         # issuer CLI
 ├── wallet.py         # wallet CLI
-├── sl_operator.py    # operator CLI (only writer to base_layer/)
+├── sl_operator.py    # operator CLI
 ├── verifier.py       # verifier CLI
-├── base_layer/       # simulated on-chain DA — block_NNN.json files
+├── base_layer/       # optional offline DA harness — block_NNN.json files
 ├── wallets/          # per-actor identity files
 ├── operator_state/   # operator's persistent state + pending queue
 └── README.md
@@ -40,15 +42,15 @@ payment_sl/
 ## Design invariants
 
 1. **Pure Python, standard library only.** No external dependencies.
-2. **All shared state is human-readable JSON on disk.** `cat` any file to follow along.
-3. **The operator is the only writer to `base_layer/`.** Issuer and wallets only touch `operator_state/pending.json`.
+2. **The payment SL owns validity.** EON only orders and stores the posted `Data`.
+3. **The operator is the only party that posts canonical batches.** Issuer and wallets only queue actions.
 4. **Nonces are automatic.** Each CLI computes the next nonce from the current state plus existing pending queue length. Users never specify nonces.
 5. **Wallet names are just local labels.** On-chain the only identifier is the address `Hash(VK)`.
 
 ## EON devnet mapping
 
-The current scripts are a local harness for the SL. They model the same
-boundary the hosted/devnet version should use:
+For the internal hosted demo, use the live devnet path as the primary
+architecture:
 
 ```mermaid
 flowchart LR
@@ -56,7 +58,6 @@ flowchart LR
   wallet["Wallet CLI / browser wallet<br/>create address, transfer"]
   pending["Pending action queue<br/>operator_state/pending.json"]
   operator["SL operator<br/>runs F(S, Input), batches actions"]
-  localBase["Local demo base layer<br/>base_layer/block_NNN.json"]
   adapter["EON devnet adapter<br/>chunk payload bytes into scalars"]
   eoncli["eoncli / eon-sdk<br/>authorize + submit transaction"]
   devnet["EON devnet<br/>https://eon.zk524.com<br/>UTXO Data availability"]
@@ -65,22 +66,14 @@ flowchart LR
   issuer --> pending
   wallet --> pending
   pending --> operator
-  operator --> localBase
   operator --> adapter
   adapter --> eoncli
   eoncli --> devnet
-  localBase --> verifier
   devnet --> verifier
 ```
 
-In the local demo, `sl_operator.py batch` writes:
-
-```text
-base_layer/block_NNN.json
-```
-
-On EON devnet, the operator would instead submit the same canonical batch
-payload as an EON output's `Data` field:
+The operator submits the canonical batch payload as an EON output's `Data`
+field:
 
 ```text
 [SL_ID][version][prev_state_hash][new_state_hash][batch_count][actions...]
@@ -116,7 +109,12 @@ scalar-oriented, so the adapter should:
 4. Authorize and submit the transaction with `eoncli` / `eon-sdk`.
 5. Let verifiers fetch the resulting UTXO, decode `Data`, and replay the SL.
 
-## Full demo walkthrough
+The existing `base_layer/block_NNN.json` writer is only an offline substitute
+for the devnet posting step. It is useful for explaining and testing the SL
+without network dependencies, but it should not be part of the hosted internal
+demo architecture.
+
+## Offline CLI walkthrough
 
 Run everything from inside the `payment_sl/` directory.
 
@@ -274,7 +272,8 @@ SL Status
 ### Verification
 
 The verifier trusts nothing except the transition function in `core.py`
-and the blocks on the base layer. It re-executes each batch and
+and the posted batch payloads. In the offline walkthrough, those payloads live
+in `base_layer/block_NNN.json`. It re-executes each batch and
 recomputes the state-hash commitment.
 
 ```bash
@@ -320,17 +319,20 @@ Deletes `operator_state/`, `base_layer/`, and `wallets/`.
 
 ## What this demo is showing
 
-The **base layer** stores opaque data. It never executes the SL's logic — it
-only guarantees the data is available. In the current Rust implementation,
-EON `Data` is scalar-oriented (`Vec<Scalar>`), so a real adapter would chunk
-or otherwise encode this demo's byte payload into scalars. `base_layer/block_NNN.json`
-is a stand-in for a UTXO whose `Data` field carries the operator's batch payload:
+The **EON devnet** stores opaque data. It never executes the SL's logic — it
+only guarantees that posted `Data` is ordered and retrievable. In the current
+Rust implementation, EON `Data` is scalar-oriented (`Vec<Scalar>`), so the
+devnet adapter should chunk or otherwise encode this demo's byte payload into
+scalars.
+
+The offline CLI walkthrough still writes `base_layer/block_NNN.json` as a local
+stand-in for a UTXO whose `Data` field carries the operator's batch payload:
 
     [SL_ID: 4B][version: 2B][prev_hash: 32B][new_hash: 32B][batch_count: 2B][actions...]
 
-Stored in `payload_hex` inside each block file. The verifier checks that
-`payload_hex` matches the canonical encoding of the decoded block fields before
-it re-executes the state transition.
+In offline mode, that payload is stored in `payload_hex` inside each block file.
+The verifier checks that `payload_hex` matches the canonical encoding of the
+decoded block fields before it re-executes the state transition.
 
 The **operator** is trusted-by-ecosystem, not trusted-by-protocol. It
 could in principle lie about the new state hash, but anyone running the
