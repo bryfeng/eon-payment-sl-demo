@@ -8,6 +8,10 @@ distinct actors interacting through simulated on-chain storage.
     Prf3 Strategy:  Path (a) — post raw inputs + state hashes, verifiers re-execute
     Base Layer:     UTXO Data payload (simulated as JSON block files)
 
+The local demo keeps the SL mechanics easy to inspect. The EON devnet version
+replaces `base_layer/block_NNN.json` with a data-bearing EON UTXO submitted
+through `eoncli` / the SDK.
+
 ## Actors
 
 | Actor        | Script        | Role                                                                     |
@@ -22,10 +26,10 @@ distinct actors interacting through simulated on-chain storage.
 
 ```
 payment_sl/
-├── core.py           # state machine (F), actions, payload serialization, tests
+├── core.py           # state machine (F), actions, payload serialization
 ├── issuer.py         # issuer CLI
 ├── wallet.py         # wallet CLI
-├── sl_operator.py       # operator CLI (only writer to base_layer/)
+├── sl_operator.py    # operator CLI (only writer to base_layer/)
 ├── verifier.py       # verifier CLI
 ├── base_layer/       # simulated on-chain DA — block_NNN.json files
 ├── wallets/          # per-actor identity files
@@ -41,20 +45,76 @@ payment_sl/
 4. **Nonces are automatic.** Each CLI computes the next nonce from the current state plus existing pending queue length. Users never specify nonces.
 5. **Wallet names are just local labels.** On-chain the only identifier is the address `Hash(VK)`.
 
-## Run the tests
+## EON devnet mapping
 
-```
-python core.py --test
-python -m unittest discover -s tests
+The current scripts are a local harness for the SL. They model the same
+boundary the hosted/devnet version should use:
+
+```mermaid
+flowchart LR
+  issuer["Issuer CLI / issuer UI<br/>mint, burn, freeze"]
+  wallet["Wallet CLI / browser wallet<br/>create address, transfer"]
+  pending["Pending action queue<br/>operator_state/pending.json"]
+  operator["SL operator<br/>runs F(S, Input), batches actions"]
+  localBase["Local demo base layer<br/>base_layer/block_NNN.json"]
+  adapter["EON devnet adapter<br/>chunk payload bytes into scalars"]
+  eoncli["eoncli / eon-sdk<br/>authorize + submit transaction"]
+  devnet["EON devnet<br/>https://eon.zk524.com<br/>UTXO Data availability"]
+  verifier["Verifier<br/>fetches payload, replays F, checks state hash"]
+
+  issuer --> pending
+  wallet --> pending
+  pending --> operator
+  operator --> localBase
+  operator --> adapter
+  adapter --> eoncli
+  eoncli --> devnet
+  localBase --> verifier
+  devnet --> verifier
 ```
 
-15 core state-machine tests plus 2 JSON round-trip tests for the
-persistence layer. The unittest suite adds focused checks around block payload
-verification.
+In the local demo, `sl_operator.py batch` writes:
 
+```text
+base_layer/block_NNN.json
 ```
-17 passed, 0 failed out of 17 tests
+
+On EON devnet, the operator would instead submit the same canonical batch
+payload as an EON output's `Data` field:
+
+```text
+[SL_ID][version][prev_state_hash][new_state_hash][batch_count][actions...]
 ```
+
+The important split stays the same:
+
+| Layer | Responsibility |
+| --- | --- |
+| Payment SL | Defines `F(S, Input)`, token balances, issuer authority, freezes, burns, transfers, and state hashes. |
+| Operator | Orders pending SL actions into batches and posts the canonical payload. |
+| EON devnet | Orders the transaction, stores the UTXO `Data`, and makes it retrievable. It does not execute payment-token logic. |
+| Verifier | Fetches the payload, decodes it, replays `F`, and checks the claimed state hash. |
+
+Useful `eoncli` commands around the devnet integration:
+
+```bash
+export EON_API_HTTP_URL=https://eon.zk524.com
+
+eoncli create-normal-account operator.pk
+eoncli get-address operator.pk
+eoncli get-balance <operator-address>
+eoncli list-utxo <operator-address>
+eoncli get-vk operator.pk
+```
+
+The ergonomic posting path still needs a small adapter. EON `Data` is currently
+scalar-oriented, so the adapter should:
+
+1. Take `BatchResult.data_field_payload()`.
+2. Frame/chunk the bytes into EON scalars.
+3. Build a self-owned data-bearing output whose amount covers `price * data_len`.
+4. Authorize and submit the transaction with `eoncli` / `eon-sdk`.
+5. Let verifiers fetch the resulting UTXO, decode `Data`, and replay the SL.
 
 ## Full demo walkthrough
 
