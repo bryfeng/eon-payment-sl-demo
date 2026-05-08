@@ -2,14 +2,13 @@
 api.py - Shared playground API for the Payment SL demo.
 
 This wraps the existing state machine, operator, devnet adapter, and verifier
-logic without introducing SQLite yet. State is still stored in the repo's
-runtime JSON directories, so this is one shared demo world.
+logic with SQLite-backed runtime storage, so this is one shared demo world that
+can be hosted on a persistent Railway volume.
 """
 
-import shutil
 from threading import RLock
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,11 +20,12 @@ from devnet_adapter import (
     envelope_from_payload_hex,
     payload_bytes_to_scalar_hex,
 )
-from verifier import accept_envelope
+from storage import DEFAULT_DB_PATH, SQLiteStorage
+from verifier import verify_envelope
 
 
-DEFAULT_ROOT = Path(__file__).parent
 STATE_LOCK = RLock()
+STORE = SQLiteStorage(DEFAULT_DB_PATH)
 
 
 app = FastAPI(
@@ -79,31 +79,11 @@ class PayloadRequest(BaseModel):
     payload_hex: str
 
 
-def configure_storage(root: Path) -> None:
-    """Point the shared JSON runtime state at a different root."""
-    root = Path(root)
-    core.ROOT = root
-    core.STATE_DIR = root / "operator_state"
-    core.WALLETS_DIR = root / "wallets"
-    core.VERIFIER_STATE_DIR = root / "verifier_state"
-    core.SL_CONFIG_FILE = core.STATE_DIR / "sl_config.json"
-    core.CURRENT_STATE_FILE = core.STATE_DIR / "current_state.json"
-    core.PENDING_FILE = core.STATE_DIR / "pending.json"
-    core.OPERATOR_META_FILE = core.STATE_DIR / "operator_meta.json"
-    core.VERIFIED_STATE_FILE = core.VERIFIER_STATE_DIR / "current_state.json"
-    core.VERIFIED_LOG_FILE = core.VERIFIER_STATE_DIR / "verified_log.json"
-
-
-def _api_wallets_file() -> Path:
-    return core.STATE_DIR / "api_wallets.json"
-
-
-def _batches_file() -> Path:
-    return core.STATE_DIR / "batches.json"
-
-
-def _initialized() -> bool:
-    return core.SL_CONFIG_FILE.exists() and core.CURRENT_STATE_FILE.exists()
+def configure_storage(root: Optional[Path] = None, db_path: Optional[Path] = None) -> None:
+    """Point the hosted API at a different SQLite database."""
+    if db_path is None:
+        db_path = DEFAULT_DB_PATH if root is None else Path(root) / "payment_sl.sqlite"
+    STORE.configure(Path(db_path))
 
 
 def _require_initialized() -> None:
@@ -114,26 +94,8 @@ def _require_initialized() -> None:
         )
 
 
-def _read_json_or_default(path: Path, default):
-    if not path.exists():
-        return default
-    return core._read_json(path)
-
-
-def _load_api_wallets() -> Dict[str, dict]:
-    return _read_json_or_default(_api_wallets_file(), {})
-
-
-def _save_api_wallets(wallets: Dict[str, dict]) -> None:
-    core._write_json(_api_wallets_file(), wallets)
-
-
-def _load_batches() -> List[dict]:
-    return _read_json_or_default(_batches_file(), [])
-
-
-def _save_batches(batches: List[dict]) -> None:
-    core._write_json(_batches_file(), batches)
+def _initialized() -> bool:
+    return STORE.is_initialized()
 
 
 def _validate_address(address: str) -> str:
@@ -160,39 +122,75 @@ def _state_to_response(state: core.State) -> dict:
 
 def _operator_state() -> core.State:
     _require_initialized()
-    return core.State.from_dict(core._read_json(core.CURRENT_STATE_FILE))
+    state = STORE.load_operator_state()
+    if state is None:
+        raise HTTPException(status_code=409, detail="operator state is missing")
+    return state
 
 
 def _verified_state() -> core.State:
-    if not core.VERIFIED_STATE_FILE.exists():
+    state = STORE.load_verified_state()
+    if state is None:
         raise HTTPException(status_code=404, detail="no verifier state found")
-    return core.State.from_dict(core._read_json(core.VERIFIED_STATE_FILE))
+    return state
 
 
 def _queue_action(action: dict) -> dict:
-    core.append_pending(action)
+    STORE.append_pending(action)
     return {
         "queued": True,
         "action": action,
-        "pending_count": len(core.load_pending()),
+        "pending_count": STORE.pending_count(),
     }
 
 
 def _issuer_vk() -> str:
     _require_initialized()
-    return core._read_json(core.SL_CONFIG_FILE)["issuer_vk"]
+    return STORE.load_sl_config()["issuer_vk"]
 
 
 def _next_nonce() -> int:
     _require_initialized()
-    return core.next_nonce()
+    return STORE.next_nonce()
 
 
 def _latest_batch() -> dict:
-    batches = _load_batches()
-    if not batches:
+    batch = STORE.latest_batch()
+    if batch is None:
         raise HTTPException(status_code=404, detail="no operator batch found")
-    return batches[-1]
+    return batch
+
+
+def _state_after_envelope(envelope: dict) -> core.State:
+    state = core.State.from_dict(envelope["prev_state"])
+    for action_dict in envelope["actions_applied"]:
+        state = core.apply_action(state, core.Action.from_dict(action_dict))
+    return state
+
+
+def _accept_envelope(envelope: dict) -> tuple[bool, str]:
+    valid, msg = verify_envelope(envelope)
+    if not valid:
+        return False, msg
+
+    log = STORE.load_verified_log()
+    sequence = int(envelope["sequence"])
+    expected_sequence = len(log) + 1
+    if sequence != expected_sequence:
+        return False, (
+            f"sequence mismatch: expected {expected_sequence}, got {sequence}"
+        )
+
+    if log:
+        current_state = STORE.load_verified_state()
+        if current_state is None:
+            return False, "verifier state is missing"
+        if current_state.state_hash() != envelope["prev_state_hash"]:
+            return False, "prev_state_hash does not match current verifier state"
+
+    state = _state_after_envelope(envelope)
+    STORE.commit_verified_envelope(envelope, state)
+    return True, "accepted"
 
 
 @app.get("/health")
@@ -206,23 +204,29 @@ def config() -> dict:
         "initialized": _initialized(),
         "sl_id": core.SL_ID.hex(),
         "version": core.VERSION.hex(),
+        "storage": {
+            "type": "sqlite",
+            "db_path": str(STORE.db_path),
+        },
     }
     if _initialized():
-        response["issuer_vk"] = core._read_json(core.SL_CONFIG_FILE)["issuer_vk"]
+        response["issuer_vk"] = STORE.load_sl_config()["issuer_vk"]
         response["operator_state_hash"] = _operator_state().state_hash()
-        response["next_batch_sequence"] = core.next_batch_sequence()
+        response["next_batch_sequence"] = STORE.next_batch_sequence()
     return response
 
 
 @app.post("/reset")
 def reset() -> dict:
     with STATE_LOCK:
-        removed = []
-        for path in (core.STATE_DIR, core.WALLETS_DIR, core.VERIFIER_STATE_DIR):
-            if path.exists():
-                shutil.rmtree(path)
-                removed.append(path.name)
-        return {"reset": True, "removed": removed}
+        STORE.reset()
+        return {
+            "reset": True,
+            "storage": {
+                "type": "sqlite",
+                "db_path": str(STORE.db_path),
+            },
+        }
 
 
 @app.post("/operator/init")
@@ -236,21 +240,12 @@ def operator_init(request: InitRequest) -> dict:
                 )
             reset()
 
-        core.STATE_DIR.mkdir(parents=True, exist_ok=True)
-        core.WALLETS_DIR.mkdir(parents=True, exist_ok=True)
-
         config_obj = {
             "issuer_vk": request.issuer_vk,
             "sl_id": core.SL_ID.hex(),
             "version": core.VERSION.hex(),
         }
-        genesis = core.State(issuer_vk=request.issuer_vk)
-        core._write_json(core.SL_CONFIG_FILE, config_obj)
-        core.save_current_state(genesis)
-        core.save_pending([])
-        core.save_operator_meta({"next_sequence": 1})
-        _save_batches([])
-        _save_api_wallets({})
+        genesis = STORE.initialize(request.issuer_vk)
 
         return {
             "initialized": True,
@@ -264,8 +259,8 @@ def operator_state() -> dict:
     state = _operator_state()
     return {
         "state": _state_to_response(state),
-        "pending_count": len(core.load_pending()),
-        "next_batch_sequence": core.next_batch_sequence(),
+        "pending_count": STORE.pending_count(),
+        "next_batch_sequence": STORE.next_batch_sequence(),
     }
 
 
@@ -289,12 +284,7 @@ def register_wallet(request: WalletRequest) -> dict:
             raise HTTPException(status_code=400, detail="vk does not match address")
 
         label = (request.label or address[:8]).strip()
-        wallets = _load_api_wallets()
-        wallets[address] = {
-            "label": label,
-            "address": address,
-        }
-        _save_api_wallets(wallets)
+        STORE.upsert_wallet(label, address)
 
         return {
             "label": label,
@@ -306,15 +296,14 @@ def register_wallet(request: WalletRequest) -> dict:
 @app.get("/wallets")
 def list_wallets() -> dict:
     _require_initialized()
-    wallets = _load_api_wallets()
-    return {"wallets": list(wallets.values())}
+    return {"wallets": STORE.list_wallets()}
 
 
 @app.get("/wallets/{address}")
 def get_wallet(address: str) -> dict:
     _require_initialized()
     addr = _validate_address(address)
-    wallet = _load_api_wallets().get(addr)
+    wallet = STORE.get_wallet(addr)
     if not wallet:
         raise HTTPException(status_code=404, detail="wallet is not registered")
     return wallet
@@ -412,27 +401,23 @@ def transfer(request: TransferRequest) -> dict:
 @app.get("/pending")
 def pending() -> dict:
     _require_initialized()
-    return {"pending": core.load_pending()}
+    return {"pending": STORE.load_pending()}
 
 
 @app.post("/operator/batch")
 def operator_batch() -> dict:
     with STATE_LOCK:
         state = _operator_state()
-        pending_actions = core.load_pending()
+        pending_actions = STORE.load_pending()
         if not pending_actions:
             return {"batched": False, "message": "No pending actions. Nothing to batch."}
 
-        sequence = core.next_batch_sequence()
+        sequence = STORE.next_batch_sequence()
         actions = [core.Action.from_dict(d) for d in pending_actions]
         new_state, result = core.process_batch(state, actions, sequence=sequence)
         payload = result.data_field_payload()
         payload_hex = payload.hex()
         data_scalars = payload_bytes_to_scalar_hex(payload)
-
-        core.save_current_state(new_state)
-        core.save_pending([])
-        core.advance_batch_sequence(sequence)
 
         rejected_index = {idx: err for idx, err in result.rejected}
         rejected = [
@@ -468,9 +453,7 @@ def operator_batch() -> dict:
             "data_len": len(data_scalars),
         }
 
-        batches = _load_batches()
-        batches.append(record)
-        _save_batches(batches)
+        STORE.commit_operator_batch(new_state, record, sequence)
 
         return {
             "batched": True,
@@ -482,7 +465,7 @@ def operator_batch() -> dict:
 @app.get("/operator/batches")
 def operator_batches() -> dict:
     _require_initialized()
-    return {"batches": _load_batches()}
+    return {"batches": STORE.list_batches()}
 
 
 @app.get("/operator/latest-payload")
@@ -521,13 +504,13 @@ def verifier_state() -> dict:
     state = _verified_state()
     return {
         "state": _state_to_response(state),
-        "accepted_payloads": len(core.load_verified_log()),
+        "accepted_payloads": len(STORE.load_verified_log()),
     }
 
 
 @app.get("/verifier/log")
 def verifier_log() -> dict:
-    return {"log": core.load_verified_log()}
+    return {"log": STORE.load_verified_log()}
 
 
 @app.post("/verifier/accept-latest-batch")
@@ -542,7 +525,7 @@ def verifier_accept_latest_batch() -> dict:
             "actions_applied": batch["actions_applied"],
             "payload_hex": batch["payload_hex"],
         }
-        valid, msg = accept_envelope(envelope)
+        valid, msg = _accept_envelope(envelope)
         if not valid:
             raise HTTPException(status_code=400, detail=msg)
 
@@ -557,7 +540,7 @@ def verifier_accept_latest_batch() -> dict:
 @app.post("/verifier/accept-envelope")
 def verifier_accept_envelope(envelope: Dict[str, Any]) -> dict:
     with STATE_LOCK:
-        valid, msg = accept_envelope(envelope)
+        valid, msg = _accept_envelope(envelope)
         if not valid:
             raise HTTPException(status_code=400, detail=msg)
 

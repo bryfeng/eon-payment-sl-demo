@@ -20,7 +20,7 @@ class ApiTests(unittest.TestCase):
         self.client = TestClient(api.app)
 
     def tearDown(self):
-        api.configure_storage(api.DEFAULT_ROOT)
+        api.configure_storage()
         self.tmp.cleanup()
 
     def _init(self):
@@ -131,6 +131,24 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["address"], address)
         self.assertFalse(response.json()["derived_from_vk"])
+
+    def test_sqlite_state_persists_after_reconfigure(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        db_path = Path(self.tmp.name) / "payment_sl.sqlite"
+
+        self.assertTrue(db_path.exists())
+
+        api.configure_storage(db_path=db_path)
+        fresh_client = TestClient(api.app)
+
+        response = fresh_client.get("/config")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["initialized"])
+
+        response = fresh_client.get(f"/wallets/{alice['address']}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["label"], "Alice")
 
 
 if __name__ == "__main__":

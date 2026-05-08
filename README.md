@@ -28,6 +28,7 @@ that payload into EON scalars and submit it with `eoncli` / the SDK.
 ```text
 payment_sl/
 ├── api.py            # FastAPI playground API around the shared demo world
+├── storage.py        # SQLite persistence for the hosted API
 ├── core.py           # state machine (F), actions, payload serialization
 ├── issuer.py         # issuer CLI
 ├── wallet.py         # wallet CLI
@@ -38,6 +39,7 @@ payment_sl/
 ├── operator_state/   # generated local state + pending queue
 ├── verifier_state/   # generated verifier-indexed accepted state
 ├── API.md            # playground API contract
+├── railway.json      # Railway start command + health check
 └── README.md
 ```
 
@@ -122,11 +124,15 @@ Then open:
 http://localhost:8000/docs
 ```
 
-The API keeps one shared demo world rather than per-user sessions. Browser
-clients can create or import a VK, derive `address = Hash(VK)`, register the
-label/address with the API, and submit sandbox transfers with the raw VK. The
-raw VK check is temporary demo auth and should later be replaced with signatures
-or proofs.
+The API keeps one shared demo world in SQLite rather than per-user sessions.
+Browser clients can create or import a VK, derive `address = Hash(VK)`,
+register the label/address with the API, and submit sandbox transfers with the
+raw VK. The raw VK check is temporary demo auth and should later be replaced
+with signatures or proofs.
+
+Runtime state defaults to `./data/payment_sl.sqlite`. For Railway, attach a
+volume at `/app/data`; the app will store the database there. Keep the Railway
+service at one replica while using SQLite.
 
 See [`API.md`](API.md) for endpoint details and the suggested demo flow.
 

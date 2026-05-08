@@ -4,11 +4,13 @@ This API exposes one shared demo world around the Payment SL. It intentionally
 does not use sessions. Everyone points at the same operator queue, operator
 state, verifier state, and wallet/address registry.
 
-The current API still uses JSON-file runtime state. SQLite is the next storage
-step, but the endpoint shape below should survive that migration.
+The API stores runtime state in SQLite. Locally it defaults to
+`./data/payment_sl.sqlite`. On Railway it will use
+`RAILWAY_VOLUME_MOUNT_PATH/payment_sl.sqlite` when a volume is attached, or
+`PAYMENT_SL_DB_PATH` if you set that variable explicitly.
 
 This API has no authentication or rate limiting. Treat it as an internal
-playground surface until an auth layer and production storage are added.
+playground surface until an auth layer and production-grade storage are added.
 
 ## Running Locally
 
@@ -22,6 +24,28 @@ Open the generated OpenAPI UI at:
 ```text
 http://localhost:8000/docs
 ```
+
+## Railway Hosting
+
+The repo includes `railway.json` with a Uvicorn start command and `/health`
+deployment health check.
+
+For a persistent demo world:
+
+1. Create one Railway web service from this repo.
+2. Attach one Railway Volume to the service.
+3. Mount the volume at `/app/data`.
+4. Keep the service at one replica while using SQLite.
+
+Optional explicit variable:
+
+```text
+PAYMENT_SL_DB_PATH=/app/data/payment_sl.sqlite
+```
+
+SQLite is a good fit for this internal sandbox as long as one API instance owns
+the file. Move to Postgres, Turso/libSQL, or another networked database before
+horizontal scaling.
 
 ## Model
 
@@ -50,8 +74,8 @@ GET /config
 POST /reset
 ```
 
-`POST /reset` clears the shared demo world: operator state, API wallet registry,
-CLI wallet directory, and verifier state.
+`POST /reset` clears the shared demo world in SQLite: operator state, pending
+actions, operator batches, wallet registry, verifier state, and verifier log.
 
 ### Operator Init
 
