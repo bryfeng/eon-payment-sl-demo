@@ -27,6 +27,7 @@ that payload into EON scalars and submit it with `eoncli` / the SDK.
 
 ```text
 payment_sl/
+├── api.py            # FastAPI playground API around the shared demo world
 ├── core.py           # state machine (F), actions, payload serialization
 ├── issuer.py         # issuer CLI
 ├── wallet.py         # wallet CLI
@@ -36,6 +37,7 @@ payment_sl/
 ├── wallets/          # generated local wallet labels
 ├── operator_state/   # generated local state + pending queue
 ├── verifier_state/   # generated verifier-indexed accepted state
+├── API.md            # playground API contract
 └── README.md
 ```
 
@@ -104,6 +106,29 @@ eoncli get-balance <operator-address>
 eoncli list-utxo <operator-address>
 eoncli get-vk operator.pk
 ```
+
+## Playground API
+
+The repo also includes a shared-world FastAPI wrapper for a hosted sandbox:
+
+```bash
+pip install -r requirements.txt
+uvicorn api:app --reload --host 0.0.0.0 --port 8000
+```
+
+Then open:
+
+```text
+http://localhost:8000/docs
+```
+
+The API keeps one shared demo world rather than per-user sessions. Browser
+clients can create or import a VK, derive `address = Hash(VK)`, register the
+label/address with the API, and submit sandbox transfers with the raw VK. The
+raw VK check is temporary demo auth and should later be replaced with signatures
+or proofs.
+
+See [`API.md`](API.md) for endpoint details and the suggested demo flow.
 
 ## CLI Walkthrough
 
