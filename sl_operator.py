@@ -5,31 +5,23 @@ The operator runs the Payment Token state machine. It:
   - initializes the SL (genesis state + directories)
   - receives actions from issuer.py and wallet.py via operator_state/pending.json
   - batches and applies them via F() from core.py
-  - posts the resulting Data payload to base_layer/block_NNN.json
+  - prepares the canonical payload that should be posted to EON devnet
   - maintains operator_state/current_state.json
-
-This is the only actor that writes to base_layer/.
 
 Commands:
   init --issuer-vk <vk>    Initialize the SL with a genesis state
   pending                  Show actions queued for the next batch
   status                   Show current SL state (hash, supply, balances, frozen)
-  batch                    Process the pending queue and post a block
-  reset                    Delete all state, base_layer blocks, and wallets
+  batch                    Process the pending queue and print the devnet payload
+  reset                    Delete local operator state and wallets
 """
 
 import argparse
-import datetime
-import json
 import shutil
 import sys
 
 from core import (
     Action,
-    ActionType,
-    BASE_LAYER_DIR,
-    CURRENT_STATE_FILE,
-    PENDING_FILE,
     SL_CONFIG_FILE,
     SL_ID,
     STATE_DIR,
@@ -61,7 +53,6 @@ def cmd_init(args) -> None:
 
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     WALLETS_DIR.mkdir(parents=True, exist_ok=True)
-    BASE_LAYER_DIR.mkdir(parents=True, exist_ok=True)
 
     config = {
         "issuer_vk": args.issuer_vk,
@@ -74,7 +65,7 @@ def cmd_init(args) -> None:
     save_current_state(genesis)
     save_pending([])
 
-    print(f"SL initialized.")
+    print("SL initialized.")
     print(f"  Issuer VK:   {args.issuer_vk}")
     print(f"  SL ID:       0x{SL_ID.hex()}")
     print(f"  Version:     0x{VERSION.hex()}")
@@ -178,41 +169,13 @@ def cmd_batch(args) -> None:
 
     actions = [Action.from_dict(d) for d in pending]
     new_state, result = process_batch(state, actions)
-
-    # Determine next block number.
-    BASE_LAYER_DIR.mkdir(parents=True, exist_ok=True)
-    existing_blocks = sorted(BASE_LAYER_DIR.glob("block_*.json"))
-    block_number = len(existing_blocks) + 1
-
     rejected_index = {idx: err for idx, err in result.rejected}
-    actions_applied = [a.to_dict() for a in result.actions]
-    actions_rejected = [
-        {"action": pending[idx], "error": err}
-        for idx, err in result.rejected
-    ]
-
     payload = result.data_field_payload()
-    block = {
-        "block_number": block_number,
-        "prev_state_hash": result.prev_state_hash,
-        "new_state_hash": result.new_state_hash,
-        "actions_applied": actions_applied,
-        "actions_rejected": actions_rejected,
-        "payload_hex": payload.hex(),
-        "payload_size_bytes": len(payload),
-        "timestamp": datetime.datetime.now(datetime.timezone.utc)
-                        .replace(microsecond=0)
-                        .isoformat()
-                        .replace("+00:00", "Z"),
-    }
-    block_path = BASE_LAYER_DIR / f"block_{block_number:03d}.json"
-    _write_json(block_path, block)
 
     save_current_state(new_state)
     save_pending([])
 
-    # Report
-    print(f"Batch posted: block_{block_number:03d}.json")
+    print("Batch prepared for EON devnet submission")
     print(f"  Submitted: {result.action_count}")
     print(f"  Applied:   {result.applied}")
     print(f"  Rejected:  {len(result.rejected)}")
@@ -225,7 +188,8 @@ def cmd_batch(args) -> None:
     print(f"  Prev state hash: {result.prev_state_hash}")
     print(f"  New state hash:  {result.new_state_hash}")
     print(f"  Payload size:    {len(payload)} bytes")
-    print(f"  Written to:      {block_path.relative_to(block_path.parent.parent)}")
+    print(f"  Payload hex:     {payload.hex()}")
+    print("  Next step: submit this payload through the EON devnet adapter.")
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +198,7 @@ def cmd_batch(args) -> None:
 
 def cmd_reset(args) -> None:
     removed = []
-    for d in (STATE_DIR, BASE_LAYER_DIR, WALLETS_DIR):
+    for d in (STATE_DIR, WALLETS_DIR):
         if d.exists():
             shutil.rmtree(d)
             removed.append(str(d.relative_to(d.parent.parent)))
@@ -251,7 +215,7 @@ def cmd_reset(args) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="sl_operator.py",
-        description="SL Operator — runs the state machine and posts to the base layer.",
+        description="SL Operator — runs the state machine and prepares devnet payloads.",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -265,10 +229,10 @@ def main() -> None:
     p_status = sub.add_parser("status", help="Show current SL state.")
     p_status.set_defaults(func=cmd_status)
 
-    p_batch = sub.add_parser("batch", help="Process the pending queue and post a block.")
+    p_batch = sub.add_parser("batch", help="Process the pending queue and print the devnet payload.")
     p_batch.set_defaults(func=cmd_batch)
 
-    p_reset = sub.add_parser("reset", help="Delete all SL state, blocks, and wallets.")
+    p_reset = sub.add_parser("reset", help="Delete local operator state and wallets.")
     p_reset.set_defaults(func=cmd_reset)
 
     args = parser.parse_args()

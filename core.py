@@ -38,7 +38,6 @@ from typing import Optional
 ROOT = Path(__file__).parent
 STATE_DIR = ROOT / "operator_state"
 WALLETS_DIR = ROOT / "wallets"
-BASE_LAYER_DIR = ROOT / "base_layer"
 
 SL_CONFIG_FILE = STATE_DIR / "sl_config.json"
 CURRENT_STATE_FILE = STATE_DIR / "current_state.json"
@@ -94,7 +93,7 @@ class Action:
         return json.dumps(payload, separators=(",", ":")).encode()
 
     def to_dict(self) -> dict:
-        """JSON-friendly dict for on-disk persistence (pending queue, block files)."""
+        """JSON-friendly dict for on-disk persistence and payload envelopes."""
         d = {
             "type": self.action_type.value,
             "sender_vk": self.sender_vk,

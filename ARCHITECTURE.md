@@ -1,202 +1,157 @@
 # EON Payment Token SL — Architecture
 
-## Data flow: who touches what
+## Data Flow
 
-```
-                        ┌────────────────────────────────────────────┐
-                        │              core.py (library)             │
-                        │  F(S, Input) -> S'  +  payload format      │
-                        │  State, Action, apply_action, verify_batch │
-                        └────────────────────────────────────────────┘
-                                  ▲ import       ▲ import
-                                  │              │
-    ┌─────────────┐   queue   ┌───┴───┐     ┌───┴───┐              ┌──────────┐
-    │  issuer.py  │──────────▶│       │     │       │──────▶ reads │wallet.py │
-    │ mint/burn/  │           │pending│     │current│              │ balance  │
-    │freeze/unfrz │           │.json  │     │_state │              └──────────┘
-    └─────────────┘           │       │     │.json  │
-                              └───┬───┘     └───▲───┘
-    ┌─────────────┐   queue      │              │ write
-    │  wallet.py  │──────────────┘              │
-    │  transfer   │                             │
-    └─────────────┘                    ┌────────┴─────────┐
-           │                           │   sl_operator.py    │
-           │ reads (resolve            │  reads pending,  │
-           │  name → address)          │  runs F(),       │
-           ▼                           │  writes block,   │
-     ┌──────────┐                      │  advances state  │
-     │ wallets/ │◀── reads ────────────┤                  │
-     │  *.json  │                      └────────┬─────────┘
-     └──────────┘                               │ append block
-                                                ▼
-                                       ┌────────────────┐
-                                       │  base_layer/   │     ┌──────────────┐
-                                       │ block_001.json │◀────│ verifier.py  │
-                                       │ block_002.json │read │ re-executes  │
-                                       │      ...       │     │ from genesis │
-                                       └────────────────┘     └──────────────┘
+```mermaid
+flowchart LR
+  issuer["issuer.py<br/>mint / burn / freeze"]
+  wallet["wallet.py<br/>create / transfer / balance"]
+  wallets["wallets/*.json<br/>local labels + demo VKs"]
+  pending["operator_state/pending.json<br/>queued SL inputs"]
+  state["operator_state/current_state.json<br/>operator's current SL state"]
+  core["core.py<br/>F(S, Input), State, Action, BatchResult"]
+  operator["sl_operator.py<br/>runs F, advances state, emits payload_hex"]
+  adapter["devnet adapter<br/>bytes -> EON scalars"]
+  eoncli["eoncli / eon-sdk<br/>authorize + submit"]
+  devnet["EON devnet<br/>UTXO Data availability"]
+  verifier["verifier.py<br/>verify decoded payload envelope"]
+
+  wallet --> wallets
+  issuer --> pending
+  wallet --> pending
+  pending --> operator
+  state --> operator
+  core --> operator
+  operator --> state
+  operator --> adapter
+  adapter --> eoncli
+  eoncli --> devnet
+  devnet --> verifier
+  core --> verifier
 ```
 
-**Who writes where:**
+The project no longer has a local base-layer substitute. The canonical target
+for posted data is EON devnet.
 
-| Directory                           | Writer(s)                                         | Readers                          |
-| ----------------------------------- | ------------------------------------------------- | -------------------------------- |
-| `wallets/`                          | `wallet.py create`                                | all CLIs (name → address lookup) |
-| `operator_state/sl_config.json`     | `sl_operator.py init`                                | `issuer.py`, `verifier.py`       |
-| `operator_state/current_state.json` | `sl_operator.py`                                     | `wallet.py balance`, nonce calc  |
-| `operator_state/pending.json`       | `issuer.py`, `wallet.py`, `sl_operator.py` (clears)  | `sl_operator.py batch`              |
-| `base_layer/block_*.json`           | `sl_operator.py batch` (only)                        | `verifier.py`                    |
+## Who Writes Where
 
-## Lifecycle of a single action
+| Path | Writer(s) | Readers |
+| --- | --- | --- |
+| `wallets/` | `wallet.py create` | all CLIs for name -> address lookup |
+| `operator_state/sl_config.json` | `sl_operator.py init` | issuer, operator, verifier tooling |
+| `operator_state/current_state.json` | `sl_operator.py batch` | wallet balance, nonce calculation, operator |
+| `operator_state/pending.json` | `issuer.py`, `wallet.py`, `sl_operator.py` clears | `sl_operator.py batch` |
+| EON devnet UTXO `Data` | devnet adapter via `eoncli` / SDK | verifier / explorer / clients |
 
+## Lifecycle Of One Action
+
+```text
+issuer.py mint --to alice --amount 10000
+  -> load issuer_vk from operator_state/sl_config.json
+  -> resolve alice through wallets/alice.json
+  -> compute next nonce from current_state + pending queue length
+  -> append action to operator_state/pending.json
+
+sl_operator.py batch
+  -> read pending actions
+  -> Action.from_dict(...)
+  -> process_batch(state, actions)
+  -> apply_action(state, action) for each input
+  -> produce BatchResult
+  -> save current_state.json
+  -> clear pending.json
+  -> print canonical payload_hex
+
+devnet adapter
+  -> take BatchResult.data_field_payload()
+  -> frame/chunk bytes into EON scalar Data
+  -> construct a data-bearing self-owned output
+  -> authorize and submit with eoncli / eon-sdk
+
+verifier.py
+  -> consume a decoded payload envelope fetched from devnet
+  -> verify payload_hex matches decoded fields
+  -> rerun F(S, Input)
+  -> compare computed state hash to claimed new_state_hash
 ```
- issuer.py mint --to alice --amount 10000
-        │
-        │ 1. load_sl_config() → read issuer_vk
-        │ 2. resolve_address("alice") → read wallets/alice.json
-        │ 3. next_nonce() → state.nonce + len(pending) + 1
-        │ 4. append_pending({type:"mint", sender_vk:..., nonce:N, to:addr, amount:10000})
-        ▼
-  operator_state/pending.json           ← action sits here until batched
-        │
-        │ sl_operator.py batch
-        │ 5. Action.from_dict(d) for each pending entry
-        │ 6. process_batch(state, actions)
-        │      → for each action: apply_action(state, action)  (F)
-        │      → returns (new_state, BatchResult)
-        │ 7. BatchResult.data_field_payload() → SL_ID|ver|prev|new|count|actions
-        │ 8. write base_layer/block_NNN.json
-        │ 9. save_current_state(new_state)
-        │10. save_pending([])
-        ▼
-  base_layer/block_NNN.json             ← the public record
-        │
-        │ verifier.py check --block base_layer/block_NNN.json
-        │11. _replay_up_to(N)  → re-execute blocks 1..N-1 from genesis
-        │12. verify_batch(prev_state, actions, claimed_new_hash)
-        │      → re-run F() and compare state_hash
-        ▼
-  VERIFIED  or  FAILED
-```
 
-## Function map per file
+## Function Map
 
-### core.py — the only module with business logic
+### `core.py`
 
-```
+```text
 Identity
-  hash_vk(vk)                       → addr = SHA256(vk)[:40]
+  hash_vk(vk)                       -> addr = SHA256(vk)[:40]
 
 Types
-  ActionType                        enum: MINT|BURN|TRANSFER|FREEZE|UNFREEZE
-  Action(type, sender_vk, nonce, to?, from_addr?, amount?, target?)
-    .serialize()                    → canonical demo payload bytes
-    .to_dict()/.from_dict()         → JSON round-trip for pending & blocks
-  State(issuer_vk, balances, total_supply, nonce, frozen)
-    .state_hash()                   → SHA256 of canonical serialization
-    .clone()                        → defensive copy (F is pure)
-    .get_balance(addr)
-    .to_dict()/.from_dict()         → JSON round-trip for current_state.json
+  ActionType                        MINT | BURN | TRANSFER | FREEZE | UNFREEZE
+  Action                            sender_vk, nonce, to?, from_addr?, amount?, target?
+  State                             issuer_vk, balances, total_supply, nonce, frozen
   TransitionError                   raised by F on rejection
 
 Transition
-  apply_action(state, action) → State            the F() itself
-  process_batch(state, [actions]) → (State, BatchResult)
-  verify_batch(prev_state, actions, claimed_hash) → (bool, msg)
-  BatchResult
-    .data_field_payload()           SL_ID|ver|prev|new|count|actions
-    .payload_size(), .summary()
-  SL_ID = 0x00010001, VERSION = 0x0001
+  apply_action(state, action)       F(S, Input) -> S'
+  process_batch(state, actions)     sequentially apply valid actions
+  verify_batch(prev_state, actions, claimed_hash)
+  BatchResult.data_field_payload()  SL_ID | version | prev | new | count | actions
 
-Persistence paths  (ROOT = __file__.parent)
-  STATE_DIR, WALLETS_DIR, BASE_LAYER_DIR
-  SL_CONFIG_FILE, CURRENT_STATE_FILE, PENDING_FILE
-
-Persistence helpers (shared by all CLIs)
-  require_sl_initialized()          abort if init not run
-  load_sl_config() / load_current_state() / save_current_state()
+Persistence helpers
+  load_sl_config()
+  load_current_state() / save_current_state()
   load_pending() / save_pending() / append_pending()
-  next_nonce()                      state.nonce + len(pending) + 1
-  load_wallet(name) / save_wallet(name, data) / resolve_address(name)
-  short(addr)                       first 8 hex chars
-
-Tests
-  run_tests()                       17 tests covering F, batch, verify, round-trips
-  __main__: python core.py --test
+  next_nonce()
+  load_wallet() / save_wallet() / resolve_address()
 ```
 
-### sl_operator.py — runs F, posts blocks
+### `sl_operator.py`
 
-```
-cmd_init      create STATE_DIR, WALLETS_DIR, BASE_LAYER_DIR;
-              write sl_config.json; persist genesis state; empty pending
-cmd_pending   load_pending() → list queued actions with _describe_action()
-cmd_status    load_current_state() → print hash/supply/nonce + labeled
-              balances and frozen addresses (uses _wallet_addr_index())
-cmd_batch     load pending → Action.from_dict → process_batch
-              → write block_NNN.json with payload_hex, timestamps, reject reasons
-              → save_current_state(new_state); save_pending([])
-cmd_reset     shutil.rmtree STATE_DIR, BASE_LAYER_DIR, WALLETS_DIR
-
-_describe_action(d)    one-line formatter used by pending + batch output
-_wallet_addr_index()   reverse map addr → name for status readability
+```text
+cmd_init      create local state directories; write config and genesis state
+cmd_pending   show queued inputs
+cmd_status    show current SL state
+cmd_batch     run F over pending inputs; print canonical devnet payload_hex
+cmd_reset     delete generated local state and wallet labels
 ```
 
-### wallet.py — end-user actions
+### `wallet.py`
 
-```
-cmd_create    generate vk = f"{name}_vk_{random_hex(8)}";
-              address = hash_vk(vk);
-              save_wallet(name, {name, vk, address})
-cmd_address   print load_wallet(name).address
-cmd_balance   load_current_state().get_balance(wallet.address)
-              + note if address is in state.frozen
-cmd_transfer  load_wallet(sender); resolve_address(recipient);
-              append_pending({type:TRANSFER, sender_vk:wallet.vk,
-                              nonce:next_nonce(), from_addr, to, amount})
+```text
+cmd_create    generate demo VK and local wallet label
+cmd_address   print local wallet address
+cmd_balance   read current SL state balance
+cmd_transfer  queue TRANSFER input
 ```
 
-### issuer.py — authority actions
+### `issuer.py`
 
-```
-_issuer_vk()     load_sl_config()["issuer_vk"]
-cmd_mint         append_pending MINT    (sender_vk = issuer_vk)
-cmd_burn         append_pending BURN    (flag --from stored as from_name
-                                         to avoid Python keyword clash)
-cmd_freeze       append_pending FREEZE
-cmd_unfreeze     append_pending UNFREEZE
-
-Every issuer command uses next_nonce() — user never specifies nonces.
+```text
+cmd_mint      queue MINT input
+cmd_burn      queue BURN input
+cmd_freeze    queue FREEZE input
+cmd_unfreeze  queue UNFREEZE input
 ```
 
-### verifier.py — trust-minimized re-execution
+### `verifier.py`
 
-```
-_load_block(path)              read JSON, fail loudly if missing
-_genesis_state()               State(issuer_vk=sl_config.issuer_vk)
-_replay_up_to(N)               walk blocks 1..N-1, verifying each, return
-                               the state that should precede block N
-_apply_block(state, block, label)
-                               sanity-check prev_hash chain,
-                               verify payload_hex,
-                               verify_batch, then re-apply actions to advance
-
-cmd_check          replay to block_N; verify_batch against claimed new_hash
-cmd_check_all      replay entire chain from genesis, one block at a time;
-                   stop at first failure, exit 1 on any mismatch
+```text
+cmd_check_envelope
+  read decoded payload envelope JSON
+  check prev_state_hash against prev_state
+  check payload_hex against canonical encoding
+  verify_batch(prev_state, actions, new_state_hash)
 ```
 
-## Trust model
+## Trust Model
 
-```
-Trusts:                          Does NOT trust:
-─────────────────────────        ─────────────────────────────
-core.py's F()                    operator's "new_state_hash" claims
-                                   (re-executes and re-hashes them)
-SL_CONFIG_FILE.issuer_vk         the contents of pending.json
-  (the registered authority)       (F() re-validates sender_vk)
-The block chain as posted        the operator's block ordering
-  (prev_hash must chain)           (caught by prev_hash mismatch)
+```text
+Trusts:                         Does NOT trust:
+-----------------------------   ------------------------------------
+core.py's F()                   operator's new_state_hash claim
+SL config issuer_vk             queued pending actions
+EON devnet ordering + DA        EON devnet to verify payment logic
+decoded devnet payload bytes    issuer/wallet labels as protocol identity
 ```
 
-The operator is **ecosystem-trusted**, not protocol-trusted. It could lie about `new_state_hash` once, but the next block's `prev_state_hash` won't chain, and `verifier.py check-all` surfaces the break immediately.
+The operator is ecosystem-trusted, not protocol-trusted. It can propose a false
+state hash, but verifiers reject the payload because re-executing `F` will not
+produce the claimed `new_state_hash`.
