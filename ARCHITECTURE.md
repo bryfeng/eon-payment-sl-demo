@@ -1,6 +1,6 @@
 # EON Payment Token SL — Architecture
 
-## Data Flow
+## Master Data Flow
 
 ```mermaid
 flowchart LR
@@ -46,6 +46,152 @@ flowchart LR
 
 The project no longer has a local base-layer substitute. The canonical target
 for posted data is EON devnet.
+
+## Isolated Flow Diagrams
+
+These diagrams are intentionally narrower than the master map. Use them as
+standalone references when explaining one part of the system at a time.
+
+### 1. Action Intake
+
+```mermaid
+flowchart LR
+  issuer["Issuer CLI<br/>mint / burn / freeze / unfreeze"]
+  wallet["Wallet CLI<br/>transfer"]
+  config["operator_state/sl_config.json<br/>issuer authority"]
+  labels["wallets/*.json<br/>local VK + address labels"]
+  nonce["next_nonce()<br/>current state + pending length"]
+  pending["operator_state/pending.json<br/>queued SL inputs"]
+
+  issuer --> config
+  issuer --> nonce
+  issuer --> pending
+  wallet --> labels
+  wallet --> nonce
+  wallet --> pending
+```
+
+What this isolates: issuer and wallet CLIs do not mutate balances. They only
+form signed-intent-like `Action` objects and append them to the operator queue.
+
+### 2. Operator Batch Execution
+
+```mermaid
+flowchart LR
+  pending["pending.json<br/>queued actions"]
+  stateIn["current_state.json<br/>previous operator state"]
+  metaIn["operator_meta.json<br/>next sequence"]
+  core["core.py<br/>F(S, Input)"]
+  operator["sl_operator.py batch"]
+  result["BatchResult<br/>sequence + hashes + applied actions"]
+  stateOut["current_state.json<br/>new operator state"]
+  metaOut["operator_meta.json<br/>sequence + 1"]
+  payload["payload_hex<br/>canonical devnet bytes"]
+
+  pending --> operator
+  stateIn --> operator
+  metaIn --> operator
+  core --> operator
+  operator --> result
+  result --> stateOut
+  result --> metaOut
+  result --> payload
+```
+
+What this isolates: the operator proposes state by running the same transition
+function that verifiers will later replay. The sequence number makes each batch
+position explicit before it reaches EON.
+
+### 3. Devnet Posting
+
+```mermaid
+flowchart LR
+  payload["payload_hex<br/>canonical Payment SL bytes"]
+  adapter["devnet_adapter.py<br/>length prefix + scalar framing"]
+  scalars["EON Data scalars<br/>ordered scalar words"]
+  submitter["eoncli / eon-sdk<br/>authorize transaction"]
+  output["Data-bearing UTXO<br/>self-owned output"]
+  devnet["EON devnet<br/>ordering + data availability"]
+
+  payload --> adapter
+  adapter --> scalars
+  scalars --> submitter
+  submitter --> output
+  output --> devnet
+```
+
+What this isolates: EON receives opaque scalar `Data`. It orders and stores the
+payload; it does not know token semantics or verify payment validity.
+
+### 4. Verifier Sync From Devnet
+
+```mermaid
+flowchart LR
+  verifier["Verifier / indexer"]
+  devnet["EON devnet<br/>UTXO set"]
+  data["Decoded UTXO Data<br/>scalar words"]
+  adapter["devnet_adapter.py<br/>scalars -> payload bytes"]
+  parser["core.parse_data_field_payload()<br/>sequence + hashes + actions"]
+  prev["verifier_state/current_state.json<br/>previous accepted state"]
+  replay["core.verify_batch()<br/>replay F(S, Input)"]
+  accepted["verifier_state/current_state.json<br/>accepted new state"]
+  log["verifier_state/verified_log.json<br/>accepted sequence log"]
+
+  verifier --> devnet
+  devnet --> data
+  data --> adapter
+  adapter --> parser
+  parser --> replay
+  prev --> replay
+  replay --> accepted
+  replay --> log
+```
+
+What this isolates: the verifier pulls ordered payloads from devnet, reconstructs
+the envelope from its own previous accepted state, and accepts only if replayed
+state matches the posted hash at the expected sequence.
+
+### 5. Wallet Read Path
+
+```mermaid
+flowchart LR
+  wallet["Wallet / client<br/>balance or history request"]
+  localLabel["wallets/*.json<br/>address lookup"]
+  verifier["Verifier service / local verifier"]
+  state["verifier_state/current_state.json<br/>accepted balances"]
+  log["verifier_state/verified_log.json<br/>accepted history"]
+  response["Wallet view<br/>balance + state hash"]
+
+  wallet --> localLabel
+  wallet --> verifier
+  verifier --> state
+  verifier --> log
+  state --> response
+  log --> response
+  response --> wallet
+```
+
+What this isolates: wallets should not depend on the operator's local state for
+truth. The ideal production path is wallet-to-verifier reads, with the verifier
+serving state it accepted from devnet-backed payloads.
+
+### 6. Trust Boundaries
+
+```mermaid
+flowchart LR
+  operator["Operator<br/>proposes batches"]
+  eon["EON devnet<br/>orders + stores Data"]
+  verifier["Verifier<br/>checks Payment SL validity"]
+  wallet["Wallet<br/>consumes verified state"]
+
+  operator -->|"payload + claimed hash"| eon
+  eon -->|"ordered opaque Data"| verifier
+  verifier -->|"accepted state + log"| wallet
+  wallet -->|"new transfer intent"| operator
+```
+
+What this isolates: EON supplies shared canonicity, the Payment SL verifier
+supplies validity, and wallets consume verifier-accepted state.
 
 ## Who Writes Where
 
