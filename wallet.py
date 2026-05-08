@@ -5,7 +5,8 @@ A wallet represents an individual user. Each wallet has a local VK and address
 stored at wallets/<name>.json. Wallets can create identities, inspect balances,
 and queue payment transfers for the operator to include in the next batch.
 
-Wallets cannot mint, burn, freeze, or post directly to the base layer.
+Wallets read balances from verifier-indexed state by default. They do not trust
+the operator's local state as the source of truth for balances.
 """
 
 import argparse
@@ -18,6 +19,7 @@ from core import (
     append_pending,
     hash_vk,
     load_current_state,
+    load_verified_state,
     load_wallet,
     next_nonce,
     resolve_address,
@@ -62,10 +64,17 @@ def cmd_address(args) -> None:
 
 def cmd_balance(args) -> None:
     wallet = load_wallet(args.name)
-    state = load_current_state()
+    if args.source == "operator":
+        state = load_current_state()
+        source = "operator"
+    else:
+        state = load_verified_state()
+        source = "verifier"
     bal = state.get_balance(wallet["address"])
     frozen_note = "  (FROZEN)" if wallet["address"] in state.frozen else ""
     print(f"{args.name}: {bal:,} tokens{frozen_note}")
+    print(f"  source: {source}")
+    print(f"  state_hash: {state.state_hash()}")
 
 
 # ---------------------------------------------------------------------------
@@ -113,8 +122,14 @@ def main() -> None:
     p_address.add_argument("--name", required=True)
     p_address.set_defaults(func=cmd_address)
 
-    p_balance = sub.add_parser("balance", help="Check wallet balance.")
+    p_balance = sub.add_parser("balance", help="Check wallet balance from verified state.")
     p_balance.add_argument("--name", required=True)
+    p_balance.add_argument(
+        "--source",
+        choices=("verifier", "operator"),
+        default="verifier",
+        help="Read from verifier-indexed state by default; operator is for local debugging.",
+    )
     p_balance.set_defaults(func=cmd_balance)
 
     p_transfer = sub.add_parser("transfer", help="Queue a transfer action.")

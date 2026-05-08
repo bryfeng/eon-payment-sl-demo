@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from core import Action, ActionType, State, hash_vk, process_batch  # noqa: E402
-from verifier import verify_envelope  # noqa: E402
+from verifier import _state_after_envelope, verify_envelope  # noqa: E402
 
 
 class PaymentSLTests(unittest.TestCase):
@@ -29,6 +29,12 @@ class PaymentSLTests(unittest.TestCase):
     def test_envelope_verifies(self):
         valid, msg = verify_envelope(self._valid_envelope())
         self.assertTrue(valid, msg)
+
+    def test_envelope_produces_verified_state(self):
+        envelope = self._valid_envelope()
+        state = _state_after_envelope(envelope)
+        self.assertEqual(state.state_hash(), envelope["new_state_hash"])
+        self.assertEqual(state.total_supply, 100)
 
     def test_payload_tampering_is_rejected(self):
         envelope = self._valid_envelope()

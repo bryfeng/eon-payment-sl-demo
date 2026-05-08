@@ -38,10 +38,13 @@ from typing import Optional
 ROOT = Path(__file__).parent
 STATE_DIR = ROOT / "operator_state"
 WALLETS_DIR = ROOT / "wallets"
+VERIFIER_STATE_DIR = ROOT / "verifier_state"
 
 SL_CONFIG_FILE = STATE_DIR / "sl_config.json"
 CURRENT_STATE_FILE = STATE_DIR / "current_state.json"
 PENDING_FILE = STATE_DIR / "pending.json"
+VERIFIED_STATE_FILE = VERIFIER_STATE_DIR / "current_state.json"
+VERIFIED_LOG_FILE = VERIFIER_STATE_DIR / "verified_log.json"
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +441,29 @@ def load_current_state() -> State:
 
 def save_current_state(state: State) -> None:
     _write_json(CURRENT_STATE_FILE, state.to_dict())
+
+
+def load_verified_state() -> State:
+    if not VERIFIED_STATE_FILE.exists():
+        sys.exit(
+            "error: no verifier state found. Run: "
+            "python verifier.py accept-envelope --file <payload-envelope.json>"
+        )
+    return State.from_dict(_read_json(VERIFIED_STATE_FILE))
+
+
+def save_verified_state(state: State) -> None:
+    _write_json(VERIFIED_STATE_FILE, state.to_dict())
+
+
+def load_verified_log() -> list:
+    if not VERIFIED_LOG_FILE.exists():
+        return []
+    return _read_json(VERIFIED_LOG_FILE)
+
+
+def save_verified_log(entries: list) -> None:
+    _write_json(VERIFIED_LOG_FILE, entries)
 
 
 def load_pending() -> list:
