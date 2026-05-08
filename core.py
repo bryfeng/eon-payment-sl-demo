@@ -15,7 +15,7 @@ It owns:
   - identity primitives (hash_vk)
   - ActionType, Action, State, TransitionError
   - apply_action (F), process_batch, verify_batch
-  - BatchResult + canonical demo payload serialization
+  - BatchResult + canonical devnet payload serialization/parsing
   - JSON round-trip helpers for on-disk persistence
   - SL_ID / VERSION constants
   - self-test suite (run with: python core.py --test)
@@ -43,6 +43,7 @@ VERIFIER_STATE_DIR = ROOT / "verifier_state"
 SL_CONFIG_FILE = STATE_DIR / "sl_config.json"
 CURRENT_STATE_FILE = STATE_DIR / "current_state.json"
 PENDING_FILE = STATE_DIR / "pending.json"
+OPERATOR_META_FILE = STATE_DIR / "operator_meta.json"
 VERIFIED_STATE_FILE = VERIFIER_STATE_DIR / "current_state.json"
 VERIFIED_LOG_FILE = VERIFIER_STATE_DIR / "verified_log.json"
 
@@ -119,7 +120,7 @@ class Action:
             sender_vk=d["sender_vk"],
             nonce=d["nonce"],
             to=d.get("to"),
-            from_addr=d.get("from_addr"),
+            from_addr=d.get("from_addr", d.get("from")),
             amount=d.get("amount"),
             target=d.get("target"),
         )
@@ -187,6 +188,11 @@ class State:
 
 class TransitionError(Exception):
     """Raised when F rejects an input."""
+    pass
+
+
+class PayloadDecodeError(Exception):
+    """Raised when a canonical devnet payload cannot be decoded."""
     pass
 
 
@@ -288,6 +294,7 @@ VERSION = b"\x00\x01"          # 2 bytes — state machine version 0.1
 class BatchResult:
     sl_id: bytes
     version: bytes
+    sequence: int
     prev_state_hash: str
     new_state_hash: str
     actions: list        # successfully applied actions, in order
@@ -297,16 +304,21 @@ class BatchResult:
 
     def data_field_payload(self) -> bytes:
         """
-        Serialize to the demo Data payload format.
+        Serialize to the canonical Data payload format.
 
-        The Rust base layer stores Data as scalars. This demo keeps the payload
-        as bytes and writes it as hex so the SL encoding is easy to inspect.
+        The EON devnet stores Data as scalars. The devnet adapter frames these
+        bytes into scalar words, and verifiers reverse that framing before
+        parsing this payload.
 
-        [SL_ID: 4B][version: 2B][prev_hash: 32B][new_hash: 32B]
+        [SL_ID: 4B][version: 2B][sequence: 8B]
+        [prev_hash: 32B][new_hash: 32B]
         [batch_count: 2B][actions...]
         """
+        if self.sequence <= 0:
+            raise ValueError("sequence must be positive")
         prev_hash_bytes = bytes.fromhex(self.prev_state_hash)
         new_hash_bytes = bytes.fromhex(self.new_state_hash)
+        sequence_bytes = struct.pack(">Q", self.sequence)
         batch_count = struct.pack(">H", self.applied)
 
         serialized_actions = b""
@@ -318,6 +330,7 @@ class BatchResult:
         return (
             self.sl_id
             + self.version
+            + sequence_bytes
             + prev_hash_bytes
             + new_hash_bytes
             + batch_count
@@ -329,7 +342,7 @@ class BatchResult:
 
     def summary(self) -> str:
         lines = [
-            f"  Batch: {self.applied} applied, {len(self.rejected)} rejected",
+            f"  Batch #{self.sequence}: {self.applied} applied, {len(self.rejected)} rejected",
             f"  Prev state: {self.prev_state_hash[:16]}...",
             f"  New state:  {self.new_state_hash[:16]}...",
             f"  Payload size: {self.payload_size()} bytes",
@@ -340,13 +353,80 @@ class BatchResult:
         return "\n".join(lines)
 
 
-def process_batch(state: State, actions: list) -> tuple:
+def parse_data_field_payload(payload: bytes) -> dict:
+    """
+    Decode canonical bytes recovered from EON UTXO Data scalars.
+
+    Returns a verifier envelope fragment:
+      sequence, prev_state_hash, new_state_hash, actions_applied, payload_hex
+    """
+    header_len = 4 + 2 + 8 + 32 + 32 + 2
+    if len(payload) < header_len:
+        raise PayloadDecodeError(
+            f"payload too short: {len(payload)} bytes, expected at least {header_len}"
+        )
+
+    offset = 0
+    sl_id = payload[offset:offset + 4]
+    offset += 4
+    if sl_id != SL_ID:
+        raise PayloadDecodeError(f"unexpected SL_ID: {sl_id.hex()}")
+
+    version = payload[offset:offset + 2]
+    offset += 2
+    if version != VERSION:
+        raise PayloadDecodeError(f"unexpected version: {version.hex()}")
+
+    sequence = struct.unpack(">Q", payload[offset:offset + 8])[0]
+    offset += 8
+    if sequence <= 0:
+        raise PayloadDecodeError("sequence must be positive")
+
+    prev_state_hash = payload[offset:offset + 32].hex()
+    offset += 32
+    new_state_hash = payload[offset:offset + 32].hex()
+    offset += 32
+
+    batch_count = struct.unpack(">H", payload[offset:offset + 2])[0]
+    offset += 2
+
+    actions = []
+    for idx in range(batch_count):
+        if offset + 2 > len(payload):
+            raise PayloadDecodeError(f"missing length prefix for action #{idx}")
+        action_len = struct.unpack(">H", payload[offset:offset + 2])[0]
+        offset += 2
+        if offset + action_len > len(payload):
+            raise PayloadDecodeError(f"truncated action #{idx}")
+        action_bytes = payload[offset:offset + action_len]
+        offset += action_len
+        try:
+            action_dict = json.loads(action_bytes.decode())
+            actions.append(Action.from_dict(action_dict).to_dict())
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError) as e:
+            raise PayloadDecodeError(f"invalid action #{idx}: {e}") from e
+
+    if offset != len(payload):
+        raise PayloadDecodeError(f"trailing bytes after payload: {len(payload) - offset}")
+
+    return {
+        "sequence": sequence,
+        "prev_state_hash": prev_state_hash,
+        "new_state_hash": new_state_hash,
+        "actions_applied": actions,
+        "payload_hex": payload.hex(),
+    }
+
+
+def process_batch(state: State, actions: list, sequence: int = 1) -> tuple:
     """
     Process a batch of actions sequentially.
 
     Applies valid actions, skips invalid ones (logged in rejected).
     Returns (final_state, batch_result).
     """
+    if sequence <= 0:
+        raise ValueError("sequence must be positive")
     prev_hash = state.state_hash()
     current = state.clone()
     applied_actions = []
@@ -362,6 +442,7 @@ def process_batch(state: State, actions: list) -> tuple:
     result = BatchResult(
         sl_id=SL_ID,
         version=VERSION,
+        sequence=sequence,
         prev_state_hash=prev_hash,
         new_state_hash=current.state_hash(),
         actions=applied_actions,
@@ -480,6 +561,26 @@ def append_pending(action_dict: dict) -> None:
     pending = load_pending()
     pending.append(action_dict)
     save_pending(pending)
+
+
+def load_operator_meta() -> dict:
+    require_sl_initialized()
+    if not OPERATOR_META_FILE.exists():
+        return {"next_sequence": 1}
+    return _read_json(OPERATOR_META_FILE)
+
+
+def save_operator_meta(meta: dict) -> None:
+    _write_json(OPERATOR_META_FILE, meta)
+
+
+def next_batch_sequence() -> int:
+    meta = load_operator_meta()
+    return int(meta.get("next_sequence", 1))
+
+
+def advance_batch_sequence(sequence: int) -> None:
+    save_operator_meta({"next_sequence": sequence + 1})
 
 
 def next_nonce() -> int:
@@ -693,11 +794,25 @@ def run_tests():
         payload = result.data_field_payload()
         assert payload[:4] == SL_ID
         assert payload[4:6] == VERSION
-        assert len(payload[6:38]) == 32   # prev hash
-        assert len(payload[38:70]) == 32  # new hash
-        count = struct.unpack(">H", payload[70:72])[0]
+        assert struct.unpack(">Q", payload[6:14])[0] == 1
+        assert len(payload[14:46]) == 32   # prev hash
+        assert len(payload[46:78]) == 32  # new hash
+        count = struct.unpack(">H", payload[78:80])[0]
         assert count == 1
     test("Payload serialization structure", t_payload)
+
+    def t_payload_parse():
+        s = State(issuer_vk=ISSUER)
+        actions = [
+            Action(ActionType.MINT, ISSUER, 1, to=addr_a, amount=100),
+        ]
+        _, result = process_batch(s, actions, sequence=7)
+        decoded = parse_data_field_payload(result.data_field_payload())
+        assert decoded["sequence"] == 7
+        assert decoded["prev_state_hash"] == result.prev_state_hash
+        assert decoded["new_state_hash"] == result.new_state_hash
+        assert decoded["actions_applied"] == [actions[0].to_dict()]
+    test("Payload parser round-trip", t_payload_parse)
 
     # Extra tests for the refactored JSON round-trip helpers used by the CLIs.
     def t_state_roundtrip():

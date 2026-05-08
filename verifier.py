@@ -17,12 +17,13 @@ Commands:
 
 import argparse
 import shutil
-import struct
 import sys
 from pathlib import Path
 
 from core import (
     Action,
+    BatchResult,
+    PayloadDecodeError,
     SL_ID,
     VERSION,
     VERIFIER_STATE_DIR,
@@ -31,6 +32,7 @@ from core import (
     apply_action,
     load_verified_log,
     load_verified_state,
+    parse_data_field_payload,
     save_verified_log,
     save_verified_state,
     verify_batch,
@@ -45,17 +47,18 @@ def _load_envelope(path: Path) -> dict:
 
 def _canonical_payload_hex(envelope: dict) -> str:
     actions = [Action.from_dict(d) for d in envelope["actions_applied"]]
-    payload = (
-        SL_ID
-        + VERSION
-        + bytes.fromhex(envelope["prev_state_hash"])
-        + bytes.fromhex(envelope["new_state_hash"])
-        + struct.pack(">H", len(actions))
+    result = BatchResult(
+        sl_id=SL_ID,
+        version=VERSION,
+        sequence=int(envelope["sequence"]),
+        prev_state_hash=envelope["prev_state_hash"],
+        new_state_hash=envelope["new_state_hash"],
+        actions=actions,
+        action_count=len(actions),
+        applied=len(actions),
+        rejected=[],
     )
-    for action in actions:
-        action_bytes = action.serialize()
-        payload += struct.pack(">H", len(action_bytes)) + action_bytes
-    return payload.hex()
+    return result.data_field_payload().hex()
 
 
 def verify_envelope(envelope: dict) -> tuple[bool, str]:
@@ -65,6 +68,7 @@ def verify_envelope(envelope: dict) -> tuple[bool, str]:
     Expected shape:
       {
         "prev_state": {... State.to_dict() ...},
+        "sequence": 1,
         "prev_state_hash": "...",
         "new_state_hash": "...",
         "actions_applied": [... Action.to_dict() ...],
@@ -76,6 +80,7 @@ def verify_envelope(envelope: dict) -> tuple[bool, str]:
     """
     required = [
         "prev_state",
+        "sequence",
         "prev_state_hash",
         "new_state_hash",
         "actions_applied",
@@ -85,6 +90,13 @@ def verify_envelope(envelope: dict) -> tuple[bool, str]:
     if missing:
         return False, f"missing required field(s): {', '.join(missing)}"
 
+    try:
+        sequence = int(envelope["sequence"])
+    except (TypeError, ValueError):
+        return False, "sequence must be an integer"
+    if sequence <= 0:
+        return False, "sequence must be positive"
+
     prev_state = State.from_dict(envelope["prev_state"])
     if prev_state.state_hash() != envelope["prev_state_hash"]:
         return False, (
@@ -93,9 +105,24 @@ def verify_envelope(envelope: dict) -> tuple[bool, str]:
             f"vs claimed {envelope['prev_state_hash'][:16]}..."
         )
 
+    try:
+        payload_bytes = bytes.fromhex(envelope["payload_hex"])
+        decoded = parse_data_field_payload(payload_bytes)
+    except (ValueError, PayloadDecodeError) as e:
+        return False, f"payload_hex is not a valid Payment SL payload: {e}"
+
     expected_payload = _canonical_payload_hex(envelope)
-    if envelope["payload_hex"] != expected_payload:
+    if envelope["payload_hex"].lower() != expected_payload:
         return False, "payload_hex does not match decoded envelope fields"
+    decoded_fields = {
+        "sequence": sequence,
+        "prev_state_hash": envelope["prev_state_hash"],
+        "new_state_hash": envelope["new_state_hash"],
+        "actions_applied": envelope["actions_applied"],
+        "payload_hex": envelope["payload_hex"].lower(),
+    }
+    if decoded != decoded_fields:
+        return False, "payload_hex does not decode to the envelope fields"
 
     actions = [Action.from_dict(d) for d in envelope["actions_applied"]]
     return verify_batch(prev_state, actions, envelope["new_state_hash"])
@@ -113,12 +140,24 @@ def accept_envelope(envelope: dict) -> tuple[bool, str]:
     if not valid:
         return False, msg
 
+    log = load_verified_log()
+    sequence = int(envelope["sequence"])
+    expected_sequence = len(log) + 1
+    if sequence != expected_sequence:
+        return False, (
+            f"sequence mismatch: expected {expected_sequence}, got {sequence}"
+        )
+
+    if log:
+        current_state = load_verified_state()
+        if current_state.state_hash() != envelope["prev_state_hash"]:
+            return False, "prev_state_hash does not match current verifier state"
+
     state = _state_after_envelope(envelope)
     save_verified_state(state)
 
-    log = load_verified_log()
     log.append({
-        "sequence": envelope.get("sequence", len(log) + 1),
+        "sequence": sequence,
         "prev_state_hash": envelope["prev_state_hash"],
         "new_state_hash": envelope["new_state_hash"],
         "actions_applied": len(envelope["actions_applied"]),
@@ -136,6 +175,7 @@ def cmd_check_envelope(args) -> None:
         sys.exit(1)
 
     print("VERIFIED")
+    print(f"  sequence:        {envelope['sequence']}")
     print(f"  prev_state_hash: {envelope['prev_state_hash']}")
     print(f"  new_state_hash:  {envelope['new_state_hash']}")
     print(f"  actions applied: {len(envelope['actions_applied'])}")
@@ -150,6 +190,7 @@ def cmd_accept_envelope(args) -> None:
 
     state = load_verified_state()
     print("ACCEPTED")
+    print(f"  sequence:            {envelope['sequence']}")
     print(f"  verified_state_hash: {state.state_hash()}")
     print(f"  total_supply:        {state.total_supply:,}")
     print(f"  nonce:               {state.nonce}")

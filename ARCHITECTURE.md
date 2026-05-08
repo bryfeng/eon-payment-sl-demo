@@ -9,14 +9,16 @@ flowchart LR
   walletRead["wallet.py balance<br/>read verified state"]
   wallets["wallets/*.json<br/>local labels + demo VKs"]
   pending["operator_state/pending.json<br/>queued SL inputs"]
+  meta["operator_state/operator_meta.json<br/>next batch sequence"]
   state["operator_state/current_state.json<br/>operator's current SL state"]
-  core["core.py<br/>F(S, Input), State, Action, BatchResult"]
+  core["core.py<br/>F(S, Input), State, Action, BatchResult, payload parser"]
   operator["sl_operator.py<br/>runs F, advances state, emits payload_hex"]
-  adapter["devnet adapter<br/>bytes -> EON scalars"]
+  adapter["devnet_adapter.py<br/>payload bytes <-> EON scalars"]
   eoncli["eoncli / eon-sdk<br/>authorize + submit"]
   devnet["EON devnet<br/>UTXO Data availability"]
   verifier["verifier.py<br/>verify decoded payload envelope"]
   verified["verifier_state/current_state.json<br/>accepted state index"]
+  verifiedLog["verifier_state/verified_log.json<br/>accepted sequence log"]
 
   wallet --> wallets
   issuer --> pending
@@ -24,15 +26,22 @@ flowchart LR
   wallet --> walletRead
   pending --> operator
   state --> operator
+  meta --> operator
   core --> operator
   operator --> state
+  operator --> meta
   operator --> adapter
   adapter --> eoncli
   eoncli --> devnet
-  devnet --> verifier
+  verifier --> devnet
+  devnet --> adapter
+  adapter --> verifier
   core --> verifier
   verifier --> verified
-  walletRead --> verified
+  verifier --> verifiedLog
+  verified --> verifier
+  verifiedLog --> verifier
+  walletRead <--> verifier
 ```
 
 The project no longer has a local base-layer substitute. The canonical target
@@ -45,6 +54,7 @@ for posted data is EON devnet.
 | `wallets/` | `wallet.py create` | all CLIs for name -> address lookup |
 | `operator_state/sl_config.json` | `sl_operator.py init` | issuer, operator, verifier tooling |
 | `operator_state/current_state.json` | `sl_operator.py batch` | wallet balance, nonce calculation, operator |
+| `operator_state/operator_meta.json` | `sl_operator.py init`, `sl_operator.py batch` | operator |
 | `operator_state/pending.json` | `issuer.py`, `wallet.py`, `sl_operator.py` clears | `sl_operator.py batch` |
 | `verifier_state/current_state.json` | `verifier.py accept-envelope` | wallets, verifier status, clients |
 | `verifier_state/verified_log.json` | `verifier.py accept-envelope` | wallets, explorers, clients |
@@ -61,29 +71,34 @@ issuer.py mint --to alice --amount 10000
 
 sl_operator.py batch
   -> read pending actions
+  -> read next batch sequence from operator_meta.json
   -> Action.from_dict(...)
-  -> process_batch(state, actions)
+  -> process_batch(state, actions, sequence)
   -> apply_action(state, action) for each input
   -> produce BatchResult
   -> save current_state.json
   -> clear pending.json
-  -> print canonical payload_hex
+  -> increment operator_meta.json next_sequence
+  -> print canonical sequence-numbered payload_hex
 
 devnet adapter
   -> take BatchResult.data_field_payload()
-  -> frame/chunk bytes into EON scalar Data
+  -> length-prefix and frame bytes into EON scalar Data
   -> construct a data-bearing self-owned output
   -> authorize and submit with eoncli / eon-sdk
 
-verifier.py
-  -> consume a decoded payload envelope fetched from devnet
-  -> verify payload_hex matches decoded fields
+verifier / indexer
+  -> query EON UTXOs carrying Payment SL Data
+  -> decode scalar Data back into payload bytes
+  -> parse sequence, hashes, and actions from payload
+  -> build an envelope using its current accepted previous state
+  -> verify payload_hex matches decoded fields and expected sequence
   -> rerun F(S, Input)
   -> compare computed state hash to claimed new_state_hash
   -> persist accepted state and verified log
 
 wallet.py balance
-  -> read verifier_state/current_state.json by default
+  -> ask/read the verifier-indexed state by default
   -> show balance at the latest verifier-accepted state
 ```
 
@@ -103,13 +118,16 @@ Types
 
 Transition
   apply_action(state, action)       F(S, Input) -> S'
-  process_batch(state, actions)     sequentially apply valid actions
+  process_batch(state, actions, sequence)
   verify_batch(prev_state, actions, claimed_hash)
-  BatchResult.data_field_payload()  SL_ID | version | prev | new | count | actions
+  BatchResult.data_field_payload()  SL_ID | version | sequence | prev | new | count | actions
+  parse_data_field_payload(bytes)   decode devnet payload bytes into envelope fields
 
 Persistence helpers
   load_sl_config()
   load_current_state() / save_current_state()
+  load_operator_meta() / save_operator_meta()
+  next_batch_sequence() / advance_batch_sequence()
   load_verified_state() / save_verified_state()
   load_verified_log() / save_verified_log()
   load_pending() / save_pending() / append_pending()
@@ -125,6 +143,17 @@ cmd_pending   show queued inputs
 cmd_status    show current SL state
 cmd_batch     run F over pending inputs; print canonical devnet payload_hex
 cmd_reset     delete generated local state and wallet labels
+```
+
+### `devnet_adapter.py`
+
+```text
+payload_bytes_to_scalar_hex()
+  length-prefix canonical payload bytes and split into current devnet scalar words
+scalar_hex_to_payload_bytes()
+  reassemble decoded EON Data scalar words into canonical payload bytes
+envelope_from_scalars()
+  parse payload bytes and combine them with verifier-held previous state
 ```
 
 ### `wallet.py`
@@ -151,10 +180,12 @@ cmd_unfreeze  queue UNFREEZE input
 cmd_check_envelope
   read decoded payload envelope JSON
   check prev_state_hash against prev_state
-  check payload_hex against canonical encoding
+  parse payload_hex and check canonical encoding
   verify_batch(prev_state, actions, new_state_hash)
 cmd_accept_envelope
   verify decoded payload envelope
+  require sequence == len(verified_log) + 1
+  require prev_state_hash matches current verifier state after genesis
   write verifier_state/current_state.json
   append verifier_state/verified_log.json
 cmd_status

@@ -18,7 +18,8 @@ that payload into EON scalars and submit it with `eoncli` / the SDK.
 | --- | --- | --- |
 | Issuer | `issuer.py` | Authority VK. Queues mint / burn / freeze / unfreeze actions. |
 | Wallet | `wallet.py` | End user. Creates local labels, queues transfers, reads balances from verifier-indexed state. |
-| Operator | `sl_operator.py` | Runs F(), batches pending actions, prepares canonical devnet payloads. |
+| Operator | `sl_operator.py` | Runs F(), batches pending actions, prepares sequence-numbered devnet payloads. |
+| Devnet adapter | `devnet_adapter.py` | Frames payload bytes into EON scalars and turns decoded UTXO data into verifier envelopes. |
 | Verifier | `verifier.py` | Re-executes decoded payload envelopes, accepts valid state, serves wallet reads. |
 | EON devnet | `eoncli` / SDK | Orders transactions and stores retrievable UTXO `Data`. |
 
@@ -30,6 +31,7 @@ payment_sl/
 ├── issuer.py         # issuer CLI
 ├── wallet.py         # wallet CLI
 ├── sl_operator.py    # operator CLI
+├── devnet_adapter.py # payload <-> scalar framing and verifier envelopes
 ├── verifier.py       # verifier CLI for decoded devnet payload envelopes
 ├── wallets/          # generated local wallet labels
 ├── operator_state/   # generated local state + pending queue
@@ -42,9 +44,10 @@ payment_sl/
 1. **The payment SL owns validity.** EON orders and stores posted `Data`; it does not execute payment-token rules.
 2. **The operator posts canonical batches.** Issuer and wallets only queue actions.
 3. **Nonces are automatic.** Each CLI computes the next nonce from current state plus pending queue length.
-4. **Wallets read verified state.** Wallet balances come from verifier-indexed state, not the operator's local state.
-5. **Wallet names are local labels.** The identity used by the SL is the address `Hash(VK)`.
-6. **EON `Data` is scalar-oriented.** The devnet adapter must frame/chunk this demo's payload bytes into EON scalars.
+4. **Batches are sequence-numbered.** Verifiers accept payloads in monotonic order.
+5. **Wallets read verified state.** Wallet balances come from verifier-indexed state, not the operator's local state.
+6. **Wallet names are local labels.** The identity used by the SL is the address `Hash(VK)`.
+7. **EON `Data` is scalar-oriented.** The devnet adapter frames/chunks this demo's payload bytes into EON scalars.
 
 ## Architecture
 
@@ -55,38 +58,40 @@ flowchart LR
   walletRead["Wallet read path<br/>balance / history"]
   pending["Pending action queue<br/>operator_state/pending.json"]
   operator["SL operator<br/>runs F(S, Input), batches actions"]
-  adapter["EON devnet adapter<br/>chunk payload bytes into scalars"]
+  adapter["devnet_adapter.py<br/>payload bytes <-> scalar Data"]
   eoncli["eoncli / eon-sdk<br/>authorize + submit transaction"]
   devnet["EON devnet<br/>https://eon.zk524.com<br/>UTXO Data availability"]
-  verifier["Verifier / indexer<br/>fetches payload, replays F, stores accepted state"]
+  verifier["Verifier / indexer<br/>pulls UTXO Data, replays F, stores accepted state"]
   verifiedState["Verifier state log<br/>verifier_state/current_state.json"]
 
   issuer --> pending
   wallet --> pending
-  wallet --> walletRead
+  wallet <--> walletRead
   pending --> operator
   operator --> adapter
   adapter --> eoncli
   eoncli --> devnet
+  verifier --> devnet
   devnet --> verifier
   verifier --> verifiedState
-  walletRead --> verifiedState
+  walletRead <--> verifier
+  verifiedState --> verifier
 ```
 
 The operator prepares this canonical payload:
 
 ```text
-[SL_ID][version][prev_state_hash][new_state_hash][batch_count][actions...]
+[SL_ID][version][sequence][prev_state_hash][new_state_hash][batch_count][actions...]
 ```
 
 The devnet adapter should:
 
 1. Take `BatchResult.data_field_payload()`.
-2. Frame/chunk the bytes into EON scalars.
+2. Frame/chunk the bytes into EON scalar words using this SL's length-prefixed framing.
 3. Build a self-owned data-bearing output whose amount covers `price * data_len`.
 4. Authorize and submit the transaction with `eoncli` / `eon-sdk`.
-5. Let verifiers fetch the resulting UTXO, decode `Data`, replay the SL, and update their accepted state log.
-6. Let wallets read balances from verifier-indexed state.
+5. Let verifiers fetch the resulting UTXO, decode scalar `Data` back into payload bytes, replay the SL, and update their accepted state log.
+6. Let wallets read balances and history from verifier-indexed state.
 
 Useful `eoncli` commands around the devnet integration:
 
@@ -127,8 +132,8 @@ python sl_operator.py status
 ```
 
 `sl_operator.py batch` applies valid actions, advances local SL state, clears
-the pending queue, and prints the canonical payload hex that should be posted to
-EON devnet by the adapter.
+the pending queue, advances `operator_state/operator_meta.json`, and prints the
+canonical payload hex that should be posted to EON devnet by the adapter.
 
 ### Payments
 
@@ -176,11 +181,24 @@ state plus decoded actions:
 ```json
 {
   "prev_state": { "...": "State.to_dict() output" },
+  "sequence": 1,
   "prev_state_hash": "hex",
   "new_state_hash": "hex",
   "actions_applied": [],
   "payload_hex": "hex"
 }
+```
+
+The adapter can also frame payloads for submission and rebuild envelopes after a
+verifier has decoded UTXO `Data` scalars:
+
+```bash
+python devnet_adapter.py encode-payload --payload-hex PAYLOAD_HEX
+python devnet_adapter.py envelope-from-scalars \
+  --scalar SCALAR_WORD_0 \
+  --scalar SCALAR_WORD_1 \
+  --prev-state-file previous-state.json \
+  --out payload-envelope.json
 ```
 
 Then run:

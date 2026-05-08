@@ -30,11 +30,14 @@ from core import (
     WALLETS_DIR,
     _read_json,
     _write_json,
+    advance_batch_sequence,
     load_current_state,
+    next_batch_sequence,
     load_pending,
     load_sl_config,
     process_batch,
     save_current_state,
+    save_operator_meta,
     save_pending,
     short,
 )
@@ -64,11 +67,13 @@ def cmd_init(args) -> None:
     genesis = State(issuer_vk=args.issuer_vk)
     save_current_state(genesis)
     save_pending([])
+    save_operator_meta({"next_sequence": 1})
 
     print("SL initialized.")
     print(f"  Issuer VK:   {args.issuer_vk}")
     print(f"  SL ID:       0x{SL_ID.hex()}")
     print(f"  Version:     0x{VERSION.hex()}")
+    print("  Next batch sequence: 1")
     print(f"  Genesis state hash: {genesis.state_hash()}")
 
 
@@ -118,6 +123,7 @@ def cmd_status(args) -> None:
     print(f"  State hash:   {state.state_hash()}")
     print(f"  Total supply: {state.total_supply:,}")
     print(f"  Nonce:        {state.nonce}")
+    print(f"  Next batch:   {next_batch_sequence()}")
 
     if state.balances:
         print(f"  Balances ({len(state.balances)}):")
@@ -167,15 +173,18 @@ def cmd_batch(args) -> None:
         print("No pending actions. Nothing to batch.")
         return
 
+    sequence = next_batch_sequence()
     actions = [Action.from_dict(d) for d in pending]
-    new_state, result = process_batch(state, actions)
+    new_state, result = process_batch(state, actions, sequence=sequence)
     rejected_index = {idx: err for idx, err in result.rejected}
     payload = result.data_field_payload()
 
     save_current_state(new_state)
     save_pending([])
+    advance_batch_sequence(sequence)
 
     print("Batch prepared for EON devnet submission")
+    print(f"  Sequence:  {result.sequence}")
     print(f"  Submitted: {result.action_count}")
     print(f"  Applied:   {result.applied}")
     print(f"  Rejected:  {len(result.rejected)}")
