@@ -198,6 +198,15 @@ def health() -> dict:
     return {"ok": True, "initialized": _initialized()}
 
 
+@app.get("/")
+def root() -> dict:
+    return {
+        "message": "EON Payment SL Playground API is live.",
+        "health": "/health",
+        "docs": "/docs",
+    }
+
+
 @app.get("/config")
 def config() -> dict:
     response = {

@@ -69,10 +69,14 @@ that later becomes a signature/proof without changing the payment flow.
 ### Health And Config
 
 ```http
+GET /
 GET /health
 GET /config
 POST /reset
 ```
+
+`GET /` returns a short liveness message for quick browser checks of the public
+Railway URL. `GET /health` remains the machine-readable health check.
 
 `POST /reset` clears the shared demo world in SQLite: operator state, pending
 actions, operator batches, wallet registry, verifier state, and verifier log.

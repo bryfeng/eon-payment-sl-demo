@@ -124,6 +124,9 @@ Then open:
 http://localhost:8000/docs
 ```
 
+The root URL returns a short liveness message. Use `/health` for the
+machine-readable health check and `/docs` for the OpenAPI UI.
+
 The API keeps one shared demo world in SQLite rather than per-user sessions.
 Browser clients can create or import a VK, derive `address = Hash(VK)`,
 register the label/address with the API, and submit sandbox transfers with the

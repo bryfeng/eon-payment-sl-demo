@@ -39,6 +39,16 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    def test_root_liveness_message(self):
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["message"],
+            "EON Payment SL Playground API is live.",
+        )
+        self.assertEqual(response.json()["health"], "/health")
+
     def test_full_mint_verify_transfer_flow(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")
