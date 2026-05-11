@@ -25,6 +25,12 @@ Open the generated OpenAPI UI at:
 http://localhost:8000/docs
 ```
 
+The deployed internal sandbox is currently:
+
+```text
+https://eon-payment-sl-demo-production.up.railway.app
+```
+
 ## Railway Hosting
 
 The repo includes `railway.json` with a Uvicorn start command and `/health`
@@ -65,6 +71,38 @@ That is intentionally not production custody. It is the temporary auth boundary
 that later becomes a signature/proof without changing the payment flow.
 
 ## Core Endpoints
+
+The fenced endpoint inventory below is tested against FastAPI's generated
+OpenAPI schema. If an endpoint is added, removed, or renamed, this block should
+change in the same commit.
+
+```api-endpoints
+GET /
+GET /health
+GET /config
+POST /reset
+POST /operator/init
+GET /operator/state
+POST /wallets
+GET /wallets
+GET /wallets/{address}
+GET /balances/{address}
+POST /actions/mint
+POST /actions/burn
+POST /actions/freeze
+POST /actions/unfreeze
+POST /actions/transfer
+GET /pending
+POST /operator/batch
+GET /operator/batches
+GET /operator/latest-payload
+POST /devnet/encode-payload
+GET /verifier/state
+GET /verifier/log
+POST /verifier/accept-latest-batch
+POST /verifier/accept-envelope
+POST /verifier/envelope-from-payload
+```
 
 ### Health And Config
 
@@ -252,3 +290,126 @@ the next integration pass.
 
 This gives a team member the full hands-on process: intent, operator batch,
 devnet-ready payload, verifier acceptance, and verified wallet state.
+
+The executable smoke flow below is also tested. Variables such as
+`$alice.address` are resolved from earlier named responses.
+
+```api-smoke-test
+[
+  {
+    "name": "reset",
+    "method": "POST",
+    "path": "/reset"
+  },
+  {
+    "name": "init",
+    "method": "POST",
+    "path": "/operator/init",
+    "body": {
+      "issuer_vk": "issuer_vk"
+    }
+  },
+  {
+    "name": "alice",
+    "method": "POST",
+    "path": "/wallets",
+    "body": {
+      "label": "Alice",
+      "vk": "alice_vk"
+    },
+    "expect": {
+      "derived_from_vk": true
+    }
+  },
+  {
+    "name": "bob",
+    "method": "POST",
+    "path": "/wallets",
+    "body": {
+      "label": "Bob",
+      "vk": "bob_vk"
+    },
+    "expect": {
+      "derived_from_vk": true
+    }
+  },
+  {
+    "name": "mint",
+    "method": "POST",
+    "path": "/actions/mint",
+    "body": {
+      "to_address": "$alice.address",
+      "amount": 100
+    },
+    "expect": {
+      "pending_count": 1
+    }
+  },
+  {
+    "name": "batch_1",
+    "method": "POST",
+    "path": "/operator/batch",
+    "expect": {
+      "batched": true
+    }
+  },
+  {
+    "name": "accept_1",
+    "method": "POST",
+    "path": "/verifier/accept-latest-batch",
+    "expect": {
+      "accepted": true,
+      "sequence": 1
+    }
+  },
+  {
+    "name": "transfer",
+    "method": "POST",
+    "path": "/actions/transfer",
+    "body": {
+      "from_address": "$alice.address",
+      "to_address": "$bob.address",
+      "amount": 40,
+      "vk": "alice_vk"
+    },
+    "expect": {
+      "pending_count": 1
+    }
+  },
+  {
+    "name": "batch_2",
+    "method": "POST",
+    "path": "/operator/batch",
+    "expect": {
+      "batched": true
+    }
+  },
+  {
+    "name": "accept_2",
+    "method": "POST",
+    "path": "/verifier/accept-latest-batch",
+    "expect": {
+      "accepted": true,
+      "sequence": 2
+    }
+  },
+  {
+    "name": "alice_balance",
+    "method": "GET",
+    "path": "/balances/$alice.address",
+    "expect": {
+      "balance": 60,
+      "source": "verifier"
+    }
+  },
+  {
+    "name": "bob_balance",
+    "method": "GET",
+    "path": "/balances/$bob.address",
+    "expect": {
+      "balance": 40,
+      "source": "verifier"
+    }
+  }
+]
+```
