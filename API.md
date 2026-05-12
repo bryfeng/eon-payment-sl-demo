@@ -99,9 +99,11 @@ GET /operator/latest-payload
 POST /devnet/encode-payload
 GET /verifier/state
 GET /verifier/log
+GET /verifier/events
 POST /verifier/accept-latest-batch
 POST /verifier/accept-envelope
 POST /verifier/envelope-from-payload
+POST /verifier/ingest-event
 ```
 
 ### Health And Config
@@ -238,6 +240,8 @@ POST /verifier/accept-envelope
 POST /verifier/envelope-from-payload
 GET /verifier/state
 GET /verifier/log
+GET /verifier/events
+POST /verifier/ingest-event
 ```
 
 `POST /verifier/accept-latest-batch` is the fastest sandbox path. It takes the
@@ -256,6 +260,25 @@ checks sequence continuity, and writes verifier-indexed state.
   "payload_hex": "hex"
 }
 ```
+
+`POST /verifier/ingest-event` accepts a normalized EON data-output event. It is
+the verifier/indexer boundary used before live block polling is wired in:
+
+```json
+{
+  "cursor": "devnet:1:0:0",
+  "network_id": "devnet",
+  "height": 1,
+  "tx_hash": "0x...",
+  "tx_index": 0,
+  "output_index": 0,
+  "data_scalars": ["0x..."]
+}
+```
+
+`GET /verifier/events` returns the stored normalized base events. `GET
+/verifier/state?sl_id=00010001` and `GET /verifier/log?sl_id=00010001` expose
+the plugin-indexed verified state and log.
 
 ### Devnet Boundary
 

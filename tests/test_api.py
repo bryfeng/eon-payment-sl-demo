@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import api  # noqa: E402
-from core import hash_vk  # noqa: E402
+from core import SL_ID, hash_vk  # noqa: E402
 
 
 class ApiTests(unittest.TestCase):
@@ -159,6 +159,48 @@ class ApiTests(unittest.TestCase):
         response = fresh_client.get(f"/wallets/{alice['address']}")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["label"], "Alice")
+
+    def test_verifier_ingests_normalized_base_event(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+
+        response = self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        batch = response.json()["batch"]
+
+        event = {
+            "cursor": "devnet:1:0:0",
+            "network_id": "devnet",
+            "height": 1,
+            "tx_hash": "0xtx",
+            "tx_index": 0,
+            "output_index": 0,
+            "utxo_id": "0xutxo",
+            "owner": "0xowner",
+            "amount": "1",
+            "data_scalars": batch["data_scalars"],
+        }
+        response = self.client.post("/verifier/ingest-event", json=event)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["accepted"])
+
+        response = self.client.get(f"/verifier/state?sl_id={SL_ID.hex()}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["state"]["total_supply"], 100)
+
+        response = self.client.get(f"/verifier/log?sl_id={SL_ID.hex()}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["log"]), 1)
+
+        response = self.client.get("/verifier/events")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["events"]), 1)
 
 
 if __name__ == "__main__":

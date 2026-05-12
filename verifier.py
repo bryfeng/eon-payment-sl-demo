@@ -22,21 +22,17 @@ from pathlib import Path
 
 from core import (
     Action,
-    BatchResult,
     PayloadDecodeError,
-    SL_ID,
-    VERSION,
     VERIFIER_STATE_DIR,
     _read_json,
     State,
     apply_action,
     load_verified_log,
     load_verified_state,
-    parse_data_field_payload,
     save_verified_log,
     save_verified_state,
-    verify_batch,
 )
+from payment_plugin import PAYMENT_PLUGIN
 
 
 def _load_envelope(path: Path) -> dict:
@@ -46,19 +42,7 @@ def _load_envelope(path: Path) -> dict:
 
 
 def _canonical_payload_hex(envelope: dict) -> str:
-    actions = [Action.from_dict(d) for d in envelope["actions_applied"]]
-    result = BatchResult(
-        sl_id=SL_ID,
-        version=VERSION,
-        sequence=int(envelope["sequence"]),
-        prev_state_hash=envelope["prev_state_hash"],
-        new_state_hash=envelope["new_state_hash"],
-        actions=actions,
-        action_count=len(actions),
-        applied=len(actions),
-        rejected=[],
-    )
-    return result.data_field_payload().hex()
+    return PAYMENT_PLUGIN.canonical_payload_hex(envelope)
 
 
 def verify_envelope(envelope: dict) -> tuple[bool, str]:
@@ -97,35 +81,14 @@ def verify_envelope(envelope: dict) -> tuple[bool, str]:
     if sequence <= 0:
         return False, "sequence must be positive"
 
-    prev_state = State.from_dict(envelope["prev_state"])
-    if prev_state.state_hash() != envelope["prev_state_hash"]:
-        return False, (
-            "prev_state_hash mismatch: "
-            f"computed {prev_state.state_hash()[:16]}... "
-            f"vs claimed {envelope['prev_state_hash'][:16]}..."
-        )
-
     try:
-        payload_bytes = bytes.fromhex(envelope["payload_hex"])
-        decoded = parse_data_field_payload(payload_bytes)
-    except (ValueError, PayloadDecodeError) as e:
+        prev_state = State.from_dict(envelope["prev_state"])
+        transition = PAYMENT_PLUGIN.transition_from_envelope(envelope)
+    except (ValueError, KeyError, PayloadDecodeError) as e:
         return False, f"payload_hex is not a valid Payment SL payload: {e}"
 
-    expected_payload = _canonical_payload_hex(envelope)
-    if envelope["payload_hex"].lower() != expected_payload:
-        return False, "payload_hex does not match decoded envelope fields"
-    decoded_fields = {
-        "sequence": sequence,
-        "prev_state_hash": envelope["prev_state_hash"],
-        "new_state_hash": envelope["new_state_hash"],
-        "actions_applied": envelope["actions_applied"],
-        "payload_hex": envelope["payload_hex"].lower(),
-    }
-    if decoded != decoded_fields:
-        return False, "payload_hex does not decode to the envelope fields"
-
-    actions = [Action.from_dict(d) for d in envelope["actions_applied"]]
-    return verify_batch(prev_state, actions, envelope["new_state_hash"])
+    result = PAYMENT_PLUGIN.verify_transition(prev_state, transition)
+    return result.valid, result.message
 
 
 def _state_after_envelope(envelope: dict) -> State:

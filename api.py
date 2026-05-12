@@ -15,13 +15,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import core
-from devnet_adapter import (
-    ScalarFramingError,
-    envelope_from_payload_hex,
-    payload_bytes_to_scalar_hex,
-)
+from devnet_adapter import envelope_from_payload_hex
+from payment_plugin import PAYMENT_PLUGIN
 from storage import DEFAULT_DB_PATH, SQLiteStorage
-from verifier import verify_envelope
+from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore
+from verifier_engine.eon_data import ScalarFramingError, payload_bytes_to_scalar_hex
 
 
 STATE_LOCK = RLock()
@@ -79,6 +77,21 @@ class PayloadRequest(BaseModel):
     payload_hex: str
 
 
+class BaseEventRequest(BaseModel):
+    cursor: str
+    network_id: str = "devnet"
+    height: int = Field(ge=0)
+    block_hash: Optional[str] = None
+    tx_hash: str
+    tx_index: int = Field(ge=0)
+    output_index: int = Field(ge=0)
+    utxo_id: Optional[str] = None
+    owner: Optional[str] = None
+    amount: str = "0"
+    data_scalars: list[str]
+    event_key: Optional[str] = None
+
+
 def configure_storage(root: Optional[Path] = None, db_path: Optional[Path] = None) -> None:
     """Point the hosted API at a different SQLite database."""
     if db_path is None:
@@ -129,10 +142,52 @@ def _operator_state() -> core.State:
 
 
 def _verified_state() -> core.State:
-    state = STORE.load_verified_state()
-    if state is None:
-        raise HTTPException(status_code=404, detail="no verifier state found")
-    return state
+    checkpoint = _verifier_store().load_checkpoint(
+        PAYMENT_PLUGIN.sl_id,
+        core.VERSION,
+    )
+    if checkpoint is not None:
+        return PAYMENT_PLUGIN.state_from_dict(checkpoint["state"])
+
+    legacy_state = STORE.load_verified_state()
+    if legacy_state is not None:
+        return legacy_state
+
+    raise HTTPException(status_code=404, detail="no verifier state found")
+
+
+def _verifier_store() -> VerifierStore:
+    return VerifierStore(STORE.db_path)
+
+
+def _verifier_engine() -> VerifierEngine:
+    config = {}
+    if _initialized():
+        config[PAYMENT_PLUGIN.sl_id.hex()] = {"issuer_vk": _issuer_vk()}
+    return VerifierEngine(
+        store=_verifier_store(),
+        registry=PluginRegistry([PAYMENT_PLUGIN]),
+        plugin_config=config,
+    )
+
+
+def _sl_id_bytes(sl_id: str) -> bytes:
+    value = sl_id.strip().lower()
+    if value.startswith("0x"):
+        value = value[2:]
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="sl_id must be hex") from e
+    if len(raw) != 4:
+        raise HTTPException(status_code=400, detail="sl_id must be 4 bytes")
+    return raw
+
+
+def _model_to_dict(model: BaseModel) -> dict:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(exclude_none=True)
+    return model.dict(exclude_none=True)
 
 
 def _queue_action(action: dict) -> dict:
@@ -161,36 +216,11 @@ def _latest_batch() -> dict:
     return batch
 
 
-def _state_after_envelope(envelope: dict) -> core.State:
-    state = core.State.from_dict(envelope["prev_state"])
-    for action_dict in envelope["actions_applied"]:
-        state = core.apply_action(state, core.Action.from_dict(action_dict))
-    return state
-
-
 def _accept_envelope(envelope: dict) -> tuple[bool, str]:
-    valid, msg = verify_envelope(envelope)
-    if not valid:
-        return False, msg
-
-    log = STORE.load_verified_log()
-    sequence = int(envelope["sequence"])
-    expected_sequence = len(log) + 1
-    if sequence != expected_sequence:
-        return False, (
-            f"sequence mismatch: expected {expected_sequence}, got {sequence}"
-        )
-
-    if log:
-        current_state = STORE.load_verified_state()
-        if current_state is None:
-            return False, "verifier state is missing"
-        if current_state.state_hash() != envelope["prev_state_hash"]:
-            return False, "prev_state_hash does not match current verifier state"
-
-    state = _state_after_envelope(envelope)
-    STORE.commit_verified_envelope(envelope, state)
-    return True, "accepted"
+    result = _verifier_engine().accept_envelope(PAYMENT_PLUGIN, envelope)
+    if result["accepted"]:
+        return True, "accepted"
+    return False, result["message"]
 
 
 @app.get("/health")
@@ -229,6 +259,7 @@ def config() -> dict:
 def reset() -> dict:
     with STATE_LOCK:
         STORE.reset()
+        _verifier_store().reset()
         return {
             "reset": True,
             "storage": {
@@ -255,6 +286,7 @@ def operator_init(request: InitRequest) -> dict:
             "version": core.VERSION.hex(),
         }
         genesis = STORE.initialize(request.issuer_vk)
+        _verifier_store().reset()
 
         return {
             "initialized": True,
@@ -509,17 +541,45 @@ def encode_payload(request: PayloadRequest) -> dict:
 
 
 @app.get("/verifier/state")
-def verifier_state() -> dict:
+def verifier_state(sl_id: str = Query(default=core.SL_ID.hex())) -> dict:
+    sl_id_bytes = _sl_id_bytes(sl_id)
+    if sl_id_bytes != PAYMENT_PLUGIN.sl_id:
+        raise HTTPException(status_code=404, detail="no plugin registered for sl_id")
     state = _verified_state()
+    log = _verifier_store().list_verification_log(sl_id_bytes)
     return {
+        "sl_id": sl_id_bytes.hex(),
         "state": _state_to_response(state),
-        "accepted_payloads": len(STORE.load_verified_log()),
+        "accepted_payloads": len([entry for entry in log if entry.get("verdict") == "accepted"]),
     }
 
 
 @app.get("/verifier/log")
-def verifier_log() -> dict:
-    return {"log": STORE.load_verified_log()}
+def verifier_log(sl_id: str = Query(default=core.SL_ID.hex())) -> dict:
+    sl_id_bytes = _sl_id_bytes(sl_id)
+    return {
+        "sl_id": sl_id_bytes.hex(),
+        "log": _verifier_store().list_verification_log(sl_id_bytes),
+    }
+
+
+@app.get("/verifier/events")
+def verifier_events(
+    after: Optional[str] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    return {
+        "events": _verifier_store().list_base_events(after=after, limit=limit),
+    }
+
+
+@app.post("/verifier/ingest-event")
+def verifier_ingest_event(event: BaseEventRequest) -> dict:
+    with STATE_LOCK:
+        result = _verifier_engine().ingest_event(_model_to_dict(event))
+        if not result.get("accepted") and not result.get("ignored"):
+            raise HTTPException(status_code=400, detail=result["message"])
+        return result
 
 
 @app.post("/verifier/accept-latest-batch")

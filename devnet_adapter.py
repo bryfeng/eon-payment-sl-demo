@@ -26,81 +26,13 @@ from core import (
     _read_json,
     parse_data_field_payload,
 )
-
-
-# Current devnet default scalar serialization is MockScalar/u32, exposed as
-# 4-byte big-endian words by eoncli's scalars_to_0x helper.
-SCALAR_BYTES = 4
-
-
-class ScalarFramingError(Exception):
-    """Raised when Data scalar words cannot be reassembled into payload bytes."""
-    pass
-
-
-def _normalize_scalar_hex(value: str) -> str:
-    scalar = value.strip().lower()
-    if scalar.startswith("0x"):
-        scalar = scalar[2:]
-    if not scalar:
-        raise ScalarFramingError("empty scalar")
-    if len(scalar) > SCALAR_BYTES * 2:
-        raise ScalarFramingError(f"scalar is wider than {SCALAR_BYTES} bytes: {value}")
-    try:
-        int(scalar, 16)
-    except ValueError as e:
-        raise ScalarFramingError(f"invalid scalar hex: {value}") from e
-    return scalar.rjust(SCALAR_BYTES * 2, "0")
-
-
-def _payload_hex_to_bytes(value: str) -> bytes:
-    payload_hex = value.strip().lower()
-    if payload_hex.startswith("0x"):
-        payload_hex = payload_hex[2:]
-    return bytes.fromhex(payload_hex)
-
-
-def payload_bytes_to_scalar_hex(payload: bytes) -> list:
-    """
-    Frame canonical payload bytes into EON scalar hex words.
-
-    The first scalar word is the byte length of the payload. Remaining words are
-    raw payload bytes, zero-padded only in the final word.
-    """
-    if len(payload) > 0xFFFFFFFF:
-        raise ScalarFramingError("payload is too large for u32 length prefix")
-
-    framed = len(payload).to_bytes(SCALAR_BYTES, "big") + payload
-    pad = (-len(framed)) % SCALAR_BYTES
-    if pad:
-        framed += b"\x00" * pad
-
-    return [
-        "0x" + framed[i:i + SCALAR_BYTES].hex()
-        for i in range(0, len(framed), SCALAR_BYTES)
-    ]
-
-
-def scalar_hex_to_payload_bytes(scalars: list) -> bytes:
-    """Reverse payload_bytes_to_scalar_hex."""
-    if not scalars:
-        raise ScalarFramingError("no scalars supplied")
-
-    raw = b"".join(bytes.fromhex(_normalize_scalar_hex(s)) for s in scalars)
-    payload_len = int.from_bytes(raw[:SCALAR_BYTES], "big")
-    payload_start = SCALAR_BYTES
-    payload_end = payload_start + payload_len
-
-    if payload_end > len(raw):
-        raise ScalarFramingError(
-            f"declared payload length {payload_len} exceeds scalar data length"
-        )
-
-    padding = raw[payload_end:]
-    if any(padding):
-        raise ScalarFramingError("non-zero bytes after declared payload length")
-
-    return raw[payload_start:payload_end]
+from verifier_engine.eon_data import (
+    SCALAR_BYTES,
+    ScalarFramingError,
+    payload_bytes_to_scalar_hex,
+    payload_hex_to_bytes,
+    scalar_hex_to_payload_bytes,
+)
 
 
 def envelope_from_payload_bytes(
@@ -138,7 +70,7 @@ def envelope_from_payload_hex(
     eon_metadata: Optional[dict] = None,
 ) -> dict:
     try:
-        payload = _payload_hex_to_bytes(payload_hex)
+        payload = payload_hex_to_bytes(payload_hex)
     except ValueError as e:
         raise PayloadDecodeError(f"invalid payload hex: {e}") from e
     return envelope_from_payload_bytes(payload, prev_state, eon_metadata)
@@ -184,7 +116,7 @@ def _write_json_result(obj: dict, out_path: Optional[str] = None) -> None:
 
 def cmd_encode_payload(args) -> None:
     try:
-        payload = _payload_hex_to_bytes(args.payload_hex)
+        payload = payload_hex_to_bytes(args.payload_hex)
         scalars = payload_bytes_to_scalar_hex(payload)
     except (ValueError, ScalarFramingError) as e:
         sys.exit(f"error: {e}")

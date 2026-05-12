@@ -1,4 +1,5 @@
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -20,7 +21,10 @@ from devnet_adapter import (  # noqa: E402
     payload_bytes_to_scalar_hex,
     scalar_hex_to_payload_bytes,
 )
+from payment_plugin import PAYMENT_PLUGIN  # noqa: E402
 from verifier import _state_after_envelope, verify_envelope  # noqa: E402
+from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore  # noqa: E402
+from verifier_engine.eon_data import payload_header  # noqa: E402
 
 
 class PaymentSLTests(unittest.TestCase):
@@ -94,6 +98,68 @@ class PaymentSLTests(unittest.TestCase):
 
         with self.assertRaises(PayloadDecodeError):
             envelope_from_scalars(payload_bytes_to_scalar_hex(payload), wrong_state)
+
+    def test_plugin_registry_dispatches_payment_sl(self):
+        registry = PluginRegistry([PAYMENT_PLUGIN])
+
+        plugin = registry.get(*payload_header(bytes.fromhex(self._valid_envelope()["payload_hex"])))
+
+        self.assertIs(plugin, PAYMENT_PLUGIN)
+
+    def test_engine_ingests_payment_event_and_is_idempotent(self):
+        envelope = self._valid_envelope()
+        event = {
+            "cursor": "devnet:1:0:0",
+            "network_id": "devnet",
+            "height": 1,
+            "tx_hash": "0xtx",
+            "tx_index": 0,
+            "output_index": 0,
+            "utxo_id": "0xutxo",
+            "owner": "0xowner",
+            "amount": "1",
+            "data_scalars": payload_bytes_to_scalar_hex(bytes.fromhex(envelope["payload_hex"])),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            engine = VerifierEngine(
+                store,
+                PluginRegistry([PAYMENT_PLUGIN]),
+                {PAYMENT_PLUGIN.sl_id.hex(): {"issuer_vk": "issuer_vk"}},
+            )
+
+            first = engine.ingest_event(event)
+            second = engine.ingest_event(event)
+            checkpoint = store.load_checkpoint(PAYMENT_PLUGIN.sl_id, next(iter(PAYMENT_PLUGIN.supported_versions)))
+
+        self.assertTrue(first["accepted"], first)
+        self.assertTrue(second["duplicate"], second)
+        self.assertEqual(checkpoint["state_hash"], envelope["new_state_hash"])
+
+    def test_unknown_sl_id_event_is_stored_not_verified(self):
+        payload = b"\xff\xff\xff\xff\x00\x01ignored"
+        event = {
+            "cursor": "devnet:1:0:0",
+            "network_id": "devnet",
+            "height": 1,
+            "tx_hash": "0xunknown",
+            "tx_index": 0,
+            "output_index": 0,
+            "data_scalars": payload_bytes_to_scalar_hex(payload),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            engine = VerifierEngine(store, PluginRegistry([PAYMENT_PLUGIN]))
+
+            result = engine.ingest_event(event)
+            events = store.list_base_events()
+            log = store.list_verification_log(PAYMENT_PLUGIN.sl_id)
+
+        self.assertTrue(result["ignored"], result)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(log, [])
 
 
 if __name__ == "__main__":
