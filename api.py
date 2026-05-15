@@ -8,7 +8,7 @@ can be hosted on a persistent Railway volume.
 
 from threading import RLock
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +50,16 @@ class WalletRequest(BaseModel):
     label: Optional[str] = None
     vk: Optional[str] = None
     address: Optional[str] = None
+    kind: Literal["user", "sl_operator", "coordinator", "verifier"] = "user"
+
+
+class SemanticLayerRequest(BaseModel):
+    name: str = Field(min_length=1)
+    sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
+    version: str = Field(default=core.VERSION.hex(), min_length=1)
+    operator_wallet_address: str
+    issuer_vk_ref: Optional[str] = None
+    operator_vk_ref: Optional[str] = None
 
 
 class AmountToRequest(BaseModel):
@@ -184,6 +194,19 @@ def _sl_id_bytes(sl_id: str) -> bytes:
     return raw
 
 
+def _version_hex(version: str) -> str:
+    value = version.strip().lower()
+    if value.startswith("0x"):
+        value = value[2:]
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="version must be hex") from e
+    if len(raw) != 2:
+        raise HTTPException(status_code=400, detail="version must be 2 bytes")
+    return raw.hex()
+
+
 def _model_to_dict(model: BaseModel) -> dict:
     if hasattr(model, "model_dump"):
         return model.model_dump(exclude_none=True)
@@ -308,7 +331,6 @@ def operator_state() -> dict:
 @app.post("/wallets")
 def register_wallet(request: WalletRequest) -> dict:
     with STATE_LOCK:
-        _require_initialized()
         vk = request.vk.strip() if request.vk else None
         address = request.address.strip().lower() if request.address else None
 
@@ -325,29 +347,63 @@ def register_wallet(request: WalletRequest) -> dict:
             raise HTTPException(status_code=400, detail="vk does not match address")
 
         label = (request.label or address[:8]).strip()
-        STORE.upsert_wallet(label, address)
+        STORE.upsert_wallet(label, address, request.kind)
 
         return {
             "label": label,
             "address": address,
+            "kind": request.kind,
             "derived_from_vk": bool(vk),
         }
 
 
 @app.get("/wallets")
 def list_wallets() -> dict:
-    _require_initialized()
     return {"wallets": STORE.list_wallets()}
 
 
 @app.get("/wallets/{address}")
 def get_wallet(address: str) -> dict:
-    _require_initialized()
     addr = _validate_address(address)
     wallet = STORE.get_wallet(addr)
     if not wallet:
         raise HTTPException(status_code=404, detail="wallet is not registered")
     return wallet
+
+
+@app.post("/semantic-layers")
+def register_semantic_layer(request: SemanticLayerRequest) -> dict:
+    with STATE_LOCK:
+        sl_id = _sl_id_bytes(request.sl_id).hex()
+        version = _version_hex(request.version)
+        operator_address = _validate_address(request.operator_wallet_address)
+        operator_wallet = STORE.get_wallet(operator_address)
+        if not operator_wallet:
+            raise HTTPException(
+                status_code=400,
+                detail="operator wallet is not registered",
+            )
+        if operator_wallet.get("kind") != "sl_operator":
+            raise HTTPException(
+                status_code=400,
+                detail="operator wallet must use kind=sl_operator",
+            )
+
+        record = {
+            "name": request.name.strip(),
+            "sl_id": sl_id,
+            "version": version,
+            "operator_wallet_address": operator_address,
+            "issuer_vk_ref": request.issuer_vk_ref,
+            "operator_vk_ref": request.operator_vk_ref,
+        }
+        STORE.upsert_semantic_layer(record)
+        return record
+
+
+@app.get("/semantic-layers")
+def list_semantic_layers() -> dict:
+    return {"semantic_layers": STORE.list_semantic_layers()}
 
 
 @app.get("/balances/{address}")

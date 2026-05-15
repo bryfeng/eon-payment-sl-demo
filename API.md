@@ -86,6 +86,8 @@ GET /operator/state
 POST /wallets
 GET /wallets
 GET /wallets/{address}
+POST /semantic-layers
+GET /semantic-layers
 GET /balances/{address}
 POST /actions/mint
 POST /actions/burn
@@ -153,7 +155,8 @@ Register by VK:
 ```json
 {
   "label": "Alice",
-  "vk": "alice_supplied_vk"
+  "vk": "alice_supplied_vk",
+  "kind": "user"
 }
 ```
 
@@ -162,12 +165,40 @@ Register by address only:
 ```json
 {
   "label": "Cold wallet",
-  "address": "40_hex_chars"
+  "address": "40_hex_chars",
+  "kind": "user"
 }
 ```
 
 The API stores label and address only. Browser clients should keep VK material
 locally.
+
+`kind` defaults to `user`. Supported values are `user`, `sl_operator`,
+`coordinator`, and `verifier`.
+
+### Semantic Layer Registry
+
+```http
+POST /semantic-layers
+GET /semantic-layers
+```
+
+Register lightweight semantic-layer metadata:
+
+```json
+{
+  "name": "Payment SL",
+  "sl_id": "00010001",
+  "version": "0001",
+  "operator_wallet_address": "40_hex_chars",
+  "issuer_vk_ref": "local:40_hex_chars",
+  "operator_vk_ref": "local:40_hex_chars"
+}
+```
+
+These records are workbench metadata. The active Payment SL runtime remains the
+single operational state machine exposed through `/operator/*`, `/actions/*`,
+and `/verifier/*`.
 
 ### Actions
 
@@ -338,10 +369,37 @@ The executable smoke flow below is also tested. Variables such as
     "path": "/wallets",
     "body": {
       "label": "Alice",
-      "vk": "alice_vk"
+      "vk": "alice_vk",
+      "kind": "user"
     },
     "expect": {
       "derived_from_vk": true
+    }
+  },
+  {
+    "name": "operator_wallet",
+    "method": "POST",
+    "path": "/wallets",
+    "body": {
+      "label": "Issuer Operator",
+      "vk": "issuer_operator_vk",
+      "kind": "sl_operator"
+    },
+    "expect": {
+      "derived_from_vk": true
+    }
+  },
+  {
+    "name": "semantic_layer",
+    "method": "POST",
+    "path": "/semantic-layers",
+    "body": {
+      "name": "Payment SL",
+      "sl_id": "00010001",
+      "version": "0001",
+      "operator_wallet_address": "$operator_wallet.address",
+      "issuer_vk_ref": "local:$operator_wallet.address",
+      "operator_vk_ref": "local:$operator_wallet.address"
     }
   },
   {
@@ -350,7 +408,8 @@ The executable smoke flow below is also tested. Variables such as
     "path": "/wallets",
     "body": {
       "label": "Bob",
-      "vk": "bob_vk"
+      "vk": "bob_vk",
+      "kind": "user"
     },
     "expect": {
       "derived_from_vk": true

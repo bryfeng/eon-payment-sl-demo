@@ -90,8 +90,21 @@ class SQLiteStorage:
             CREATE TABLE IF NOT EXISTS wallets (
               address TEXT PRIMARY KEY,
               label TEXT NOT NULL,
+              kind TEXT NOT NULL DEFAULT 'user',
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS semantic_layers (
+              sl_id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              version TEXT NOT NULL,
+              operator_wallet_address TEXT NOT NULL,
+              issuer_vk_ref TEXT,
+              operator_vk_ref TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(operator_wallet_address) REFERENCES wallets(address)
             );
 
             CREATE TABLE IF NOT EXISTS pending_actions (
@@ -119,6 +132,14 @@ class SQLiteStorage:
             );
             """
         )
+        wallet_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(wallets)").fetchall()
+        }
+        if "kind" not in wallet_columns:
+            conn.execute(
+                "ALTER TABLE wallets ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'"
+            )
 
     def _put_json(self, conn: sqlite3.Connection, key: str, value: Any) -> None:
         conn.execute(
@@ -190,6 +211,7 @@ class SQLiteStorage:
     def reset(self) -> None:
         with self.connect() as conn:
             for table in (
+                "semantic_layers",
                 "verifier_log",
                 "operator_batches",
                 "pending_actions",
@@ -213,7 +235,6 @@ class SQLiteStorage:
                 "verifier_log",
                 "operator_batches",
                 "pending_actions",
-                "wallets",
                 "states",
                 "kv",
             ):
@@ -273,28 +294,30 @@ class SQLiteStorage:
             raise RuntimeError("operator state is not initialized")
         return state.nonce + self.pending_count() + 1
 
-    def upsert_wallet(self, label: str, address: str) -> None:
+    def upsert_wallet(self, label: str, address: str, kind: str = "user") -> None:
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO wallets (address, label, updated_at)
-                VALUES (?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO wallets (address, label, kind, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(address) DO UPDATE SET
                   label = excluded.label,
+                  kind = excluded.kind,
                   updated_at = CURRENT_TIMESTAMP
                 """,
-                (address, label),
+                (address, label, kind),
             )
 
     def list_wallets(self) -> list:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT address, label FROM wallets ORDER BY label, address"
+                "SELECT address, label, kind FROM wallets ORDER BY label, address"
             ).fetchall()
         return [
             {
                 "label": row["label"],
                 "address": row["address"],
+                "kind": row["kind"],
             }
             for row in rows
         ]
@@ -302,7 +325,7 @@ class SQLiteStorage:
     def get_wallet(self, address: str) -> Optional[dict]:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT address, label FROM wallets WHERE address = ?",
+                "SELECT address, label, kind FROM wallets WHERE address = ?",
                 (address,),
             ).fetchone()
         if row is None:
@@ -310,7 +333,71 @@ class SQLiteStorage:
         return {
             "label": row["label"],
             "address": row["address"],
+            "kind": row["kind"],
         }
+
+    def upsert_semantic_layer(self, record: dict) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO semantic_layers (
+                  sl_id,
+                  name,
+                  version,
+                  operator_wallet_address,
+                  issuer_vk_ref,
+                  operator_vk_ref,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(sl_id) DO UPDATE SET
+                  name = excluded.name,
+                  version = excluded.version,
+                  operator_wallet_address = excluded.operator_wallet_address,
+                  issuer_vk_ref = excluded.issuer_vk_ref,
+                  operator_vk_ref = excluded.operator_vk_ref,
+                  updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    record["sl_id"],
+                    record["name"],
+                    record["version"],
+                    record["operator_wallet_address"],
+                    record.get("issuer_vk_ref"),
+                    record.get("operator_vk_ref"),
+                ),
+            )
+
+    def list_semantic_layers(self) -> list:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  sl_id,
+                  name,
+                  version,
+                  operator_wallet_address,
+                  issuer_vk_ref,
+                  operator_vk_ref,
+                  created_at,
+                  updated_at
+                FROM semantic_layers
+                ORDER BY updated_at DESC, name, sl_id
+                """
+            ).fetchall()
+        return [
+            {
+                "sl_id": row["sl_id"],
+                "name": row["name"],
+                "version": row["version"],
+                "operator_wallet_address": row["operator_wallet_address"],
+                "issuer_vk_ref": row["issuer_vk_ref"],
+                "operator_vk_ref": row["operator_vk_ref"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
 
     def list_batches(self) -> list:
         with self.connect() as conn:

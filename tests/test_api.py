@@ -39,6 +39,14 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
+    def _operator_wallet(self, label="Issuer Operator", vk="issuer_operator_vk"):
+        response = self.client.post(
+            "/wallets",
+            json={"label": label, "vk": vk, "kind": "sl_operator"},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
     def test_root_liveness_message(self):
         response = self.client.get("/")
 
@@ -140,7 +148,74 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["address"], address)
+        self.assertEqual(response.json()["kind"], "user")
         self.assertFalse(response.json()["derived_from_vk"])
+
+    def test_wallet_registration_stores_kind_before_runtime_init(self):
+        operator = self._operator_wallet()
+
+        response = self.client.get("/wallets")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(operator["kind"], "sl_operator")
+        self.assertEqual(response.json()["wallets"][0]["kind"], "sl_operator")
+
+    def test_semantic_layer_records_can_be_created_and_listed(self):
+        operator = self._operator_wallet()
+
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": operator["address"],
+                "issuer_vk_ref": f"local:{operator['address']}",
+                "operator_vk_ref": f"local:{operator['address']}",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["name"], "Payment SL")
+        self.assertEqual(response.json()["operator_wallet_address"], operator["address"])
+
+        response = self.client.get("/semantic-layers")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(response.json()["semantic_layers"]), 1)
+        self.assertEqual(
+            response.json()["semantic_layers"][0]["operator_wallet_address"],
+            operator["address"],
+        )
+
+    def test_semantic_layer_rejects_invalid_operator_address(self):
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Broken SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": "not_hex",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("address must", response.json()["detail"])
+
+    def test_semantic_layer_requires_operator_wallet_kind(self):
+        user = self._wallet("Alice", "alice_vk")
+
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": user["address"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("kind=sl_operator", response.json()["detail"])
 
     def test_sqlite_state_persists_after_reconfigure(self):
         self._init()
