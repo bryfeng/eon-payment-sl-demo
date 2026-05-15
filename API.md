@@ -86,6 +86,8 @@ GET /operator/state
 POST /wallets
 GET /wallets
 GET /wallets/{address}
+POST /base-layer/accounts
+GET /base-layer/accounts
 POST /semantic-layers
 GET /semantic-layers
 GET /balances/{address}
@@ -99,6 +101,8 @@ POST /operator/batch
 GET /operator/batches
 GET /operator/latest-payload
 POST /devnet/encode-payload
+GET /devnet/status
+POST /devnet/submit-latest-batch
 GET /verifier/state
 GET /verifier/log
 GET /verifier/events
@@ -176,6 +180,32 @@ locally.
 `kind` defaults to `user`. Supported values are `user`, `sl_operator`,
 `coordinator`, and `verifier`.
 
+### Base-Layer Account Registry
+
+```http
+POST /base-layer/accounts
+GET /base-layer/accounts
+```
+
+Register encrypted EON account JSON for a wallet identity:
+
+```json
+{
+  "label": "Payment SL poster",
+  "owner_wallet_address": "40_hex_chars",
+  "eon_address": "0x64_hex_chars",
+  "account_json": {
+    "account_type": "normal",
+    "address": "0x64_hex_chars",
+    "rng_seed": "0x..."
+  }
+}
+```
+
+`account_json.address` can supply `eon_address` if the request omits it. The
+API encrypts the JSON with `EON_KEY_ENCRYPTION_SECRET` before writing SQLite and
+never returns plaintext account material through API responses.
+
 ### Semantic Layer Registry
 
 ```http
@@ -191,6 +221,7 @@ Register lightweight semantic-layer metadata:
   "sl_id": "00010001",
   "version": "0001",
   "operator_wallet_address": "40_hex_chars",
+  "base_layer_account_id": "acct_...",
   "issuer_vk_ref": "local:40_hex_chars",
   "operator_vk_ref": "local:40_hex_chars"
 }
@@ -315,6 +346,8 @@ the plugin-indexed verified state and log.
 
 ```http
 POST /devnet/encode-payload
+GET /devnet/status
+POST /devnet/submit-latest-batch
 ```
 
 Request:
@@ -325,9 +358,55 @@ Request:
 }
 ```
 
-This returns the scalar words that would be carried in EON UTXO `Data`. Live
-submission and UTXO sync are intentionally left behind the devnet boundary for
-the next integration pass.
+`POST /devnet/encode-payload` returns the scalar words carried in EON UTXO
+`Data`.
+
+`GET /devnet/status` reports whether live devnet submission is configured:
+
+```json
+{
+  "network_id": "devnet",
+  "api_url": "https://eon.zk524.com",
+  "submitter": "command",
+  "submitter_configured": true,
+  "account_vault_configured": true,
+  "active_base_layer_account_id": "acct_...",
+  "enabled": true,
+  "ready": true
+}
+```
+
+`POST /devnet/submit-latest-batch` submits the latest operator batch through a
+configured submitter command and persists the returned transaction metadata on
+the batch record. The command is configured with `EON_DEVNET_SUBMIT_CMD`; it
+receives JSON on stdin with `api_url`, `sequence`, `payload_hex`, and
+`data_scalars`, then must return JSON containing at least `tx_hash`. The API
+decrypts the active semantic layer's bound base-layer account JSON and exposes
+it to the submitter as a temporary `EON_OPERATOR_WALLET_FILE` for that call.
+
+Example submitter response:
+
+```json
+{
+  "response": "ok",
+  "tx_hash": "0x...",
+  "utxo_id": "0x...",
+  "spent_utxo": "0x...",
+  "owner": "0x...",
+  "output_index": 0,
+  "amount": "1"
+}
+```
+
+The API returns `503` when no live submitter or bound base-layer account is
+configured. This is deliberate: encoding a devnet-ready payload is not the same
+thing as writing it to devnet.
+
+For the local sibling `eon-sdk` checkout, `examples/post_payment_sl_payload.rs`
+implements this command protocol and posts the scalar data through EON JSON-RPC
+`submit_transaction` using `EON_OPERATOR_WALLET_FILE`. The file env remains the
+submitter boundary, but the hosted workbench should populate it from encrypted
+SQLite account records instead of a global Railway file.
 
 ## Suggested Demo Flow
 

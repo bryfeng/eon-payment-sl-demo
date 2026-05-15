@@ -95,16 +95,29 @@ class SQLiteStorage:
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE TABLE IF NOT EXISTS base_layer_accounts (
+              id TEXT PRIMARY KEY,
+              owner_wallet_address TEXT NOT NULL,
+              label TEXT NOT NULL,
+              eon_address TEXT NOT NULL,
+              encrypted_account_json TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY(owner_wallet_address) REFERENCES wallets(address)
+            );
+
             CREATE TABLE IF NOT EXISTS semantic_layers (
               sl_id TEXT PRIMARY KEY,
               name TEXT NOT NULL,
               version TEXT NOT NULL,
               operator_wallet_address TEXT NOT NULL,
+              base_layer_account_id TEXT,
               issuer_vk_ref TEXT,
               operator_vk_ref TEXT,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-              FOREIGN KEY(operator_wallet_address) REFERENCES wallets(address)
+              FOREIGN KEY(operator_wallet_address) REFERENCES wallets(address),
+              FOREIGN KEY(base_layer_account_id) REFERENCES base_layer_accounts(id)
             );
 
             CREATE TABLE IF NOT EXISTS pending_actions (
@@ -140,6 +153,37 @@ class SQLiteStorage:
             conn.execute(
                 "ALTER TABLE wallets ADD COLUMN kind TEXT NOT NULL DEFAULT 'user'"
             )
+        semantic_layer_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(semantic_layers)").fetchall()
+        }
+        if "base_layer_account_id" not in semantic_layer_columns:
+            conn.execute("ALTER TABLE semantic_layers ADD COLUMN base_layer_account_id TEXT")
+
+    def _record_devnet_submission(
+        self,
+        conn: sqlite3.Connection,
+        sequence: int,
+        submission: dict,
+    ) -> dict:
+        row = conn.execute(
+            "SELECT record_json FROM operator_batches WHERE sequence = ?",
+            (sequence,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"batch {sequence} not found")
+
+        record = _loads(row["record_json"])
+        record["devnet_submission"] = submission
+        conn.execute(
+            """
+            UPDATE operator_batches
+            SET record_json = ?
+            WHERE sequence = ?
+            """,
+            (_dumps(record), sequence),
+        )
+        return record
 
     def _put_json(self, conn: sqlite3.Connection, key: str, value: Any) -> None:
         conn.execute(
@@ -212,6 +256,7 @@ class SQLiteStorage:
         with self.connect() as conn:
             for table in (
                 "semantic_layers",
+                "base_layer_accounts",
                 "verifier_log",
                 "operator_batches",
                 "pending_actions",
@@ -336,6 +381,98 @@ class SQLiteStorage:
             "kind": row["kind"],
         }
 
+    def create_base_layer_account(self, record: dict) -> dict:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO base_layer_accounts (
+                  id,
+                  owner_wallet_address,
+                  label,
+                  eon_address,
+                  encrypted_account_json,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    record["id"],
+                    record["owner_wallet_address"],
+                    record["label"],
+                    record["eon_address"],
+                    record["encrypted_account_json"],
+                ),
+            )
+        return self.get_base_layer_account(record["id"], include_secret=False)
+
+    def list_base_layer_accounts(self) -> list:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  id,
+                  owner_wallet_address,
+                  label,
+                  eon_address,
+                  created_at,
+                  updated_at
+                FROM base_layer_accounts
+                ORDER BY updated_at DESC, label, id
+                """
+            ).fetchall()
+        return [
+            {
+                "id": row["id"],
+                "owner_wallet_address": row["owner_wallet_address"],
+                "label": row["label"],
+                "eon_address": row["eon_address"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def base_layer_account_count(self) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM base_layer_accounts"
+            ).fetchone()
+        return int(row["count"])
+
+    def get_base_layer_account(
+        self,
+        account_id: str,
+        include_secret: bool = False,
+    ) -> Optional[dict]:
+        columns = """
+          id,
+          owner_wallet_address,
+          label,
+          eon_address,
+          encrypted_account_json,
+          created_at,
+          updated_at
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                f"SELECT {columns} FROM base_layer_accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return None
+
+        record = {
+            "id": row["id"],
+            "owner_wallet_address": row["owner_wallet_address"],
+            "label": row["label"],
+            "eon_address": row["eon_address"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+        if include_secret:
+            record["encrypted_account_json"] = row["encrypted_account_json"]
+        return record
+
     def upsert_semantic_layer(self, record: dict) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -345,15 +482,17 @@ class SQLiteStorage:
                   name,
                   version,
                   operator_wallet_address,
+                  base_layer_account_id,
                   issuer_vk_ref,
                   operator_vk_ref,
                   updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(sl_id) DO UPDATE SET
                   name = excluded.name,
                   version = excluded.version,
                   operator_wallet_address = excluded.operator_wallet_address,
+                  base_layer_account_id = excluded.base_layer_account_id,
                   issuer_vk_ref = excluded.issuer_vk_ref,
                   operator_vk_ref = excluded.operator_vk_ref,
                   updated_at = CURRENT_TIMESTAMP
@@ -363,10 +502,44 @@ class SQLiteStorage:
                     record["name"],
                     record["version"],
                     record["operator_wallet_address"],
+                    record.get("base_layer_account_id"),
                     record.get("issuer_vk_ref"),
                     record.get("operator_vk_ref"),
                 ),
             )
+
+    def get_semantic_layer(self, sl_id: str) -> Optional[dict]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  sl_id,
+                  name,
+                  version,
+                  operator_wallet_address,
+                  base_layer_account_id,
+                  issuer_vk_ref,
+                  operator_vk_ref,
+                  created_at,
+                  updated_at
+                FROM semantic_layers
+                WHERE sl_id = ?
+                """,
+                (sl_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sl_id": row["sl_id"],
+            "name": row["name"],
+            "version": row["version"],
+            "operator_wallet_address": row["operator_wallet_address"],
+            "base_layer_account_id": row["base_layer_account_id"],
+            "issuer_vk_ref": row["issuer_vk_ref"],
+            "operator_vk_ref": row["operator_vk_ref"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def list_semantic_layers(self) -> list:
         with self.connect() as conn:
@@ -377,6 +550,7 @@ class SQLiteStorage:
                   name,
                   version,
                   operator_wallet_address,
+                  base_layer_account_id,
                   issuer_vk_ref,
                   operator_vk_ref,
                   created_at,
@@ -391,6 +565,7 @@ class SQLiteStorage:
                 "name": row["name"],
                 "version": row["version"],
                 "operator_wallet_address": row["operator_wallet_address"],
+                "base_layer_account_id": row["base_layer_account_id"],
                 "issuer_vk_ref": row["issuer_vk_ref"],
                 "operator_vk_ref": row["operator_vk_ref"],
                 "created_at": row["created_at"],
@@ -450,6 +625,10 @@ class SQLiteStorage:
                     record["new_state_hash"],
                 ),
             )
+
+    def record_devnet_submission(self, sequence: int, submission: dict) -> dict:
+        with self.connect() as conn:
+            return self._record_devnet_submission(conn, sequence, submission)
 
     def load_verified_log(self) -> list:
         with self.connect() as conn:

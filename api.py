@@ -9,13 +9,25 @@ can be hosted on a persistent Railway volume.
 from threading import RLock
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from account_vault import (
+    AccountVaultError,
+    decrypt_account_json,
+    encrypt_account_json,
+    vault_configured,
+)
 import core
 from devnet_adapter import envelope_from_payload_hex
+from devnet_submitter import (
+    DevnetSubmitError,
+    devnet_status as command_devnet_status,
+    submit_batch_to_devnet,
+)
 from payment_plugin import PAYMENT_PLUGIN
 from storage import DEFAULT_DB_PATH, SQLiteStorage
 from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore
@@ -58,8 +70,16 @@ class SemanticLayerRequest(BaseModel):
     sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
     version: str = Field(default=core.VERSION.hex(), min_length=1)
     operator_wallet_address: str
+    base_layer_account_id: Optional[str] = None
     issuer_vk_ref: Optional[str] = None
     operator_vk_ref: Optional[str] = None
+
+
+class BaseLayerAccountRequest(BaseModel):
+    label: str = Field(min_length=1)
+    owner_wallet_address: str
+    eon_address: Optional[str] = None
+    account_json: dict[str, Any]
 
 
 class AmountToRequest(BaseModel):
@@ -85,6 +105,10 @@ class TransferRequest(BaseModel):
 
 class PayloadRequest(BaseModel):
     payload_hex: str
+
+
+class DevnetSubmitRequest(BaseModel):
+    force: bool = False
 
 
 class BaseEventRequest(BaseModel):
@@ -130,6 +154,36 @@ def _validate_address(address: str) -> str:
     except ValueError as e:
         raise HTTPException(status_code=400, detail="address must be hex") from e
     return addr
+
+
+def _validate_eon_address(address: str) -> str:
+    value = address.strip().lower()
+    raw = value[2:] if value.startswith("0x") else value
+    if not raw:
+        raise HTTPException(status_code=400, detail="eon_address is required")
+    try:
+        int(raw, 16)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="eon_address must be hex") from e
+    return f"0x{raw}"
+
+
+def _account_json_address(account_json: dict[str, Any]) -> Optional[str]:
+    address = account_json.get("address")
+    if not isinstance(address, str) or not address.strip():
+        return None
+    return _validate_eon_address(address)
+
+
+def _public_base_layer_account(record: dict) -> dict:
+    return {
+        "id": record["id"],
+        "owner_wallet_address": record["owner_wallet_address"],
+        "label": record["label"],
+        "eon_address": record["eon_address"],
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+    }
 
 
 def _state_to_response(state: core.State) -> dict:
@@ -237,6 +291,58 @@ def _latest_batch() -> dict:
     if batch is None:
         raise HTTPException(status_code=404, detail="no operator batch found")
     return batch
+
+
+def _active_semantic_layer_record() -> Optional[dict]:
+    sl_id = core.SL_ID.hex()
+    config = STORE.load_sl_config()
+    if config and config.get("sl_id"):
+        sl_id = str(config["sl_id"])
+    return STORE.get_semantic_layer(sl_id)
+
+
+def _devnet_runtime_status() -> dict:
+    status = command_devnet_status()
+    active_record = _active_semantic_layer_record()
+    active_account_id = active_record.get("base_layer_account_id") if active_record else None
+    vault_ready = vault_configured()
+    account_ready = bool(status.get("wallet_file_configured") or (active_account_id and vault_ready))
+    submitter_ready = bool(status.get("submitter_configured", status.get("enabled")))
+
+    status.update(
+        {
+            "account_vault_configured": vault_ready,
+            "base_layer_account_count": STORE.base_layer_account_count(),
+            "active_semantic_layer_id": active_record.get("sl_id") if active_record else None,
+            "active_base_layer_account_id": active_account_id,
+            "account_configured": account_ready,
+            "ready": submitter_ready and account_ready,
+            "enabled": submitter_ready and account_ready,
+        }
+    )
+    return status
+
+
+def _submission_account_json() -> Optional[dict[str, Any]]:
+    active_record = _active_semantic_layer_record()
+    if not active_record:
+        return None
+
+    account_id = active_record.get("base_layer_account_id")
+    if not account_id:
+        return None
+
+    account_record = STORE.get_base_layer_account(account_id, include_secret=True)
+    if not account_record:
+        raise HTTPException(
+            status_code=409,
+            detail="active semantic layer references a missing base-layer account",
+        )
+
+    try:
+        return decrypt_account_json(account_record["encrypted_account_json"])
+    except AccountVaultError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 def _accept_envelope(envelope: dict) -> tuple[bool, str]:
@@ -371,6 +477,57 @@ def get_wallet(address: str) -> dict:
     return wallet
 
 
+@app.post("/base-layer/accounts")
+def register_base_layer_account(request: BaseLayerAccountRequest) -> dict:
+    with STATE_LOCK:
+        owner_address = _validate_address(request.owner_wallet_address)
+        owner_wallet = STORE.get_wallet(owner_address)
+        if not owner_wallet:
+            raise HTTPException(status_code=400, detail="owner wallet is not registered")
+
+        json_address = _account_json_address(request.account_json)
+        requested_address = (
+            _validate_eon_address(request.eon_address)
+            if request.eon_address
+            else json_address
+        )
+        if not requested_address:
+            raise HTTPException(
+                status_code=400,
+                detail="provide eon_address or account_json.address",
+            )
+        if json_address and requested_address != json_address:
+            raise HTTPException(
+                status_code=400,
+                detail="eon_address does not match account_json.address",
+            )
+
+        try:
+            encrypted_account_json = encrypt_account_json(request.account_json)
+        except AccountVaultError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+        record = {
+            "id": f"acct_{uuid4().hex[:12]}",
+            "owner_wallet_address": owner_address,
+            "label": request.label.strip(),
+            "eon_address": requested_address,
+            "encrypted_account_json": encrypted_account_json,
+        }
+        created = STORE.create_base_layer_account(record)
+        return _public_base_layer_account(created)
+
+
+@app.get("/base-layer/accounts")
+def list_base_layer_accounts() -> dict:
+    return {
+        "accounts": [
+            _public_base_layer_account(record)
+            for record in STORE.list_base_layer_accounts()
+        ]
+    }
+
+
 @app.post("/semantic-layers")
 def register_semantic_layer(request: SemanticLayerRequest) -> dict:
     with STATE_LOCK:
@@ -389,11 +546,30 @@ def register_semantic_layer(request: SemanticLayerRequest) -> dict:
                 detail="operator wallet must use kind=sl_operator",
             )
 
+        base_layer_account_id = (
+            request.base_layer_account_id.strip()
+            if request.base_layer_account_id
+            else None
+        )
+        if base_layer_account_id:
+            base_layer_account = STORE.get_base_layer_account(base_layer_account_id)
+            if not base_layer_account:
+                raise HTTPException(
+                    status_code=400,
+                    detail="base-layer account is not registered",
+                )
+            if base_layer_account["owner_wallet_address"] != operator_address:
+                raise HTTPException(
+                    status_code=400,
+                    detail="base-layer account must belong to operator wallet",
+                )
+
         record = {
             "name": request.name.strip(),
             "sl_id": sl_id,
             "version": version,
             "operator_wallet_address": operator_address,
+            "base_layer_account_id": base_layer_account_id,
             "issuer_vk_ref": request.issuer_vk_ref,
             "operator_vk_ref": request.operator_vk_ref,
         }
@@ -593,6 +769,59 @@ def encode_payload(request: PayloadRequest) -> dict:
         "scalar_bytes": 4,
         "data_scalars": scalars,
         "data_len": len(scalars),
+    }
+
+
+@app.get("/devnet/status")
+def get_devnet_status() -> dict:
+    return _devnet_runtime_status()
+
+
+@app.post("/devnet/submit-latest-batch")
+def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
+    with STATE_LOCK:
+        batch = _latest_batch()
+        existing = batch.get("devnet_submission")
+        if existing and existing.get("status") == "submitted" and not request.force:
+            raise HTTPException(
+                status_code=409,
+                detail="latest batch is already submitted to devnet; pass force=true to resubmit",
+            )
+
+        try:
+            status = _devnet_runtime_status()
+            if not status["ready"]:
+                if not status.get("submitter_configured"):
+                    raise DevnetSubmitError(
+                        "EON devnet submission is not configured. Set EON_DEVNET_SUBMIT_CMD "
+                        "to a command that signs and submits the payload transaction."
+                    )
+                if (
+                    status.get("active_base_layer_account_id")
+                    and not status.get("account_vault_configured")
+                    and not status.get("wallet_file_configured")
+                ):
+                    raise DevnetSubmitError(
+                        "EON_KEY_ENCRYPTION_SECRET is required to decrypt the bound "
+                        "base-layer account"
+                    )
+                raise DevnetSubmitError(
+                    "active semantic layer has no bound base-layer account; register one "
+                    "or configure legacy EON_OPERATOR_WALLET_FILE"
+                )
+
+            submission = submit_batch_to_devnet(batch, _submission_account_json())
+            updated_batch = STORE.record_devnet_submission(batch["sequence"], submission)
+        except DevnetSubmitError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+
+    return {
+        "submitted": True,
+        "sequence": submission["sequence"],
+        "devnet_submission": submission,
+        "batch": updated_batch,
     }
 
 

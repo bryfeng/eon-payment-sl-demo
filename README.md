@@ -109,6 +109,37 @@ eoncli list-utxo <operator-address>
 eoncli get-vk operator.pk
 ```
 
+The hosted API can submit the latest batch to live devnet when a submitter
+command is configured:
+
+```bash
+export EON_DEVNET_API_URL=https://eon.zk524.com
+export EON_DEVNET_SUBMIT_CMD="/path/to/eon-devnet-submit"
+export EON_KEY_ENCRYPTION_SECRET="long random deployment secret"
+```
+
+`POST /devnet/submit-latest-batch` sends the latest `payload_hex` and
+`data_scalars` to that command over stdin. The command signs and submits the
+data-bearing transaction, then returns JSON with at least `tx_hash`. Operator
+EON account JSON is stored encrypted in SQLite and bound to semantic-layer
+registry records, so each operator can post with its own base-layer account.
+Without `EON_DEVNET_SUBMIT_CMD` and a bound base-layer account, the API reports
+devnet submission as unconfigured instead of pretending that local scalar
+encoding wrote to the base layer.
+
+For local workspace testing with the sibling `eon-sdk` checkout, the command can
+point at the generic submitter example:
+
+```bash
+export EON_OPERATOR_WALLET_FILE=/path/to/operator_key.json
+export EON_DEVNET_SUBMIT_CMD="cargo run --quiet --manifest-path /path/to/eon-sdk/Cargo.toml --example post_payment_sl_payload"
+```
+
+`EON_OPERATOR_WALLET_FILE` is still supported as a local fallback. The hosted
+workbench path should use `POST /base-layer/accounts` plus
+`POST /semantic-layers` instead, letting the API decrypt the selected account to
+a temporary file only for the submitter subprocess.
+
 ## Playground API
 
 The repo also includes a shared-world FastAPI wrapper for a hosted sandbox:
