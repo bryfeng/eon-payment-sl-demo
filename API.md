@@ -88,6 +88,7 @@ GET /wallets
 GET /wallets/{address}
 POST /base-layer/accounts
 GET /base-layer/accounts
+POST /base-layer/accounts/generate
 POST /semantic-layers
 GET /semantic-layers
 GET /balances/{address}
@@ -185,6 +186,7 @@ locally.
 ```http
 POST /base-layer/accounts
 GET /base-layer/accounts
+POST /base-layer/accounts/generate
 ```
 
 Register encrypted EON account JSON for a wallet identity:
@@ -205,6 +207,19 @@ Register encrypted EON account JSON for a wallet identity:
 `account_json.address` can supply `eon_address` if the request omits it. The
 API encrypts the JSON with `EON_KEY_ENCRYPTION_SECRET` before writing SQLite and
 never returns plaintext account material through API responses.
+
+Generate and store a base-layer signing account for an SL operator:
+
+```json
+{
+  "label": "Payment SL poster",
+  "owner_wallet_address": "40_hex_chars"
+}
+```
+
+`POST /base-layer/accounts/generate` returns an assigned account id and EON
+address for the operator wallet. Use that id as `base_layer_account_id` when
+registering a semantic-layer record.
 
 ### Semantic Layer Registry
 
@@ -369,6 +384,8 @@ Request:
   "api_url": "https://eon.zk524.com",
   "submitter": "command",
   "submitter_configured": true,
+  "account_generator": "configured",
+  "account_generator_configured": true,
   "account_vault_configured": true,
   "active_base_layer_account_id": "acct_...",
   "enabled": true,

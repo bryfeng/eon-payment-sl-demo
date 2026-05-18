@@ -6,6 +6,7 @@ logic with SQLite-backed runtime storage, so this is one shared demo world that
 can be hosted on a persistent Railway volume.
 """
 
+import sqlite3
 from threading import RLock
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -80,6 +81,24 @@ class BaseLayerAccountRequest(BaseModel):
     owner_wallet_address: str
     eon_address: Optional[str] = None
     account_json: dict[str, Any]
+
+
+class BaseLayerAccountPoolRequest(BaseModel):
+    label: str = Field(min_length=1)
+    eon_address: Optional[str] = None
+    account_json: dict[str, Any]
+    funding_tx_hash: Optional[str] = None
+    funded_amount: Optional[str] = None
+    balance_last_checked: Optional[str] = None
+
+
+class BaseLayerAccountAllocateRequest(BaseModel):
+    label: Optional[str] = None
+    owner_wallet_address: str
+
+
+class BaseLayerAccountGenerateRequest(BaseLayerAccountAllocateRequest):
+    pass
 
 
 class AmountToRequest(BaseModel):
@@ -184,6 +203,102 @@ def _public_base_layer_account(record: dict) -> dict:
         "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),
     }
+
+
+def _public_base_layer_pool_account(record: dict) -> dict:
+    return {
+        "id": record["id"],
+        "label": record["label"],
+        "eon_address": record["eon_address"],
+        "status": record["status"],
+        "assigned_base_layer_account_id": record.get("assigned_base_layer_account_id"),
+        "funding_tx_hash": record.get("funding_tx_hash"),
+        "funded_amount": record.get("funded_amount"),
+        "balance_last_checked": record.get("balance_last_checked"),
+        "created_at": record.get("created_at"),
+        "updated_at": record.get("updated_at"),
+        "assigned_at": record.get("assigned_at"),
+    }
+
+
+def _store_base_layer_account(
+    label: str,
+    owner_wallet_address: str,
+    account_json: dict[str, Any],
+    eon_address: Optional[str] = None,
+) -> dict:
+    owner_address = _validate_address(owner_wallet_address)
+    owner_wallet = STORE.get_wallet(owner_address)
+    if not owner_wallet:
+        raise HTTPException(status_code=400, detail="owner wallet is not registered")
+
+    json_address = _account_json_address(account_json)
+    requested_address = _validate_eon_address(eon_address) if eon_address else json_address
+    if not requested_address:
+        raise HTTPException(
+            status_code=400,
+            detail="provide eon_address or account_json.address",
+        )
+    if json_address and requested_address != json_address:
+        raise HTTPException(
+            status_code=400,
+            detail="eon_address does not match account_json.address",
+        )
+
+    try:
+        encrypted_account_json = encrypt_account_json(account_json)
+    except AccountVaultError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    record = {
+        "id": f"acct_{uuid4().hex[:12]}",
+        "owner_wallet_address": owner_address,
+        "label": label.strip(),
+        "eon_address": requested_address,
+        "encrypted_account_json": encrypted_account_json,
+    }
+    created = STORE.create_base_layer_account(record)
+    return _public_base_layer_account(created)
+
+
+def _store_base_layer_pool_account(request: BaseLayerAccountPoolRequest) -> dict:
+    json_address = _account_json_address(request.account_json)
+    requested_address = (
+        _validate_eon_address(request.eon_address) if request.eon_address else json_address
+    )
+    if not requested_address:
+        raise HTTPException(
+            status_code=400,
+            detail="provide eon_address or account_json.address",
+        )
+    if json_address and requested_address != json_address:
+        raise HTTPException(
+            status_code=400,
+            detail="eon_address does not match account_json.address",
+        )
+
+    try:
+        encrypted_account_json = encrypt_account_json(request.account_json)
+    except AccountVaultError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    record = {
+        "id": f"pool_{uuid4().hex[:12]}",
+        "label": request.label.strip(),
+        "eon_address": requested_address,
+        "encrypted_account_json": encrypted_account_json,
+        "funding_tx_hash": request.funding_tx_hash,
+        "funded_amount": request.funded_amount,
+        "balance_last_checked": request.balance_last_checked,
+    }
+    try:
+        created = STORE.import_base_layer_pool_account(record)
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(
+            status_code=409,
+            detail="base-layer account already exists in the pool",
+        ) from e
+    return _public_base_layer_pool_account(created)
 
 
 def _state_to_response(state: core.State) -> dict:
@@ -306,12 +421,16 @@ def _devnet_runtime_status() -> dict:
     active_record = _active_semantic_layer_record()
     active_account_id = active_record.get("base_layer_account_id") if active_record else None
     vault_ready = vault_configured()
+    pool_counts = STORE.base_layer_account_pool_counts()
+    account_generator_ready = bool(vault_ready and pool_counts["available"] > 0)
     account_ready = bool(status.get("wallet_file_configured") or (active_account_id and vault_ready))
     submitter_ready = bool(status.get("submitter_configured", status.get("enabled")))
 
     status.update(
         {
             "account_vault_configured": vault_ready,
+            "account_generator": "configured" if account_generator_ready else None,
+            "account_generator_configured": account_generator_ready,
             "base_layer_account_count": STORE.base_layer_account_count(),
             "active_semantic_layer_id": active_record.get("sl_id") if active_record else None,
             "active_base_layer_account_id": active_account_id,
@@ -480,42 +599,12 @@ def get_wallet(address: str) -> dict:
 @app.post("/base-layer/accounts")
 def register_base_layer_account(request: BaseLayerAccountRequest) -> dict:
     with STATE_LOCK:
-        owner_address = _validate_address(request.owner_wallet_address)
-        owner_wallet = STORE.get_wallet(owner_address)
-        if not owner_wallet:
-            raise HTTPException(status_code=400, detail="owner wallet is not registered")
-
-        json_address = _account_json_address(request.account_json)
-        requested_address = (
-            _validate_eon_address(request.eon_address)
-            if request.eon_address
-            else json_address
+        return _store_base_layer_account(
+            request.label,
+            request.owner_wallet_address,
+            request.account_json,
+            request.eon_address,
         )
-        if not requested_address:
-            raise HTTPException(
-                status_code=400,
-                detail="provide eon_address or account_json.address",
-            )
-        if json_address and requested_address != json_address:
-            raise HTTPException(
-                status_code=400,
-                detail="eon_address does not match account_json.address",
-            )
-
-        try:
-            encrypted_account_json = encrypt_account_json(request.account_json)
-        except AccountVaultError as e:
-            raise HTTPException(status_code=503, detail=str(e)) from e
-
-        record = {
-            "id": f"acct_{uuid4().hex[:12]}",
-            "owner_wallet_address": owner_address,
-            "label": request.label.strip(),
-            "eon_address": requested_address,
-            "encrypted_account_json": encrypted_account_json,
-        }
-        created = STORE.create_base_layer_account(record)
-        return _public_base_layer_account(created)
 
 
 @app.get("/base-layer/accounts")
@@ -526,6 +615,61 @@ def list_base_layer_accounts() -> dict:
             for record in STORE.list_base_layer_accounts()
         ]
     }
+
+
+@app.post("/base-layer/account-pool", include_in_schema=False)
+def import_base_layer_pool_account(request: BaseLayerAccountPoolRequest) -> dict:
+    with STATE_LOCK:
+        return _store_base_layer_pool_account(request)
+
+
+@app.get("/base-layer/account-pool", include_in_schema=False)
+def list_base_layer_pool_accounts() -> dict:
+    return {
+        "accounts": [
+            _public_base_layer_pool_account(record)
+            for record in STORE.list_base_layer_pool_accounts()
+        ],
+        "counts": STORE.base_layer_account_pool_counts(),
+    }
+
+
+def _allocate_base_layer_account_for_operator(
+    request: BaseLayerAccountAllocateRequest,
+) -> dict:
+    with STATE_LOCK:
+        owner_address = _validate_address(request.owner_wallet_address)
+        owner_wallet = STORE.get_wallet(owner_address)
+        if not owner_wallet:
+            raise HTTPException(status_code=400, detail="owner wallet is not registered")
+        if owner_wallet.get("kind") != "sl_operator":
+            raise HTTPException(
+                status_code=400,
+                detail="owner wallet must use kind=sl_operator",
+            )
+
+        account = STORE.allocate_base_layer_account(
+            owner_address,
+            request.label.strip() if request.label else None,
+        )
+        if not account:
+            raise HTTPException(
+                status_code=409,
+                detail="base-layer account generation is temporarily unavailable",
+            )
+        return _public_base_layer_account(account)
+
+
+@app.post("/base-layer/accounts/generate")
+def generate_base_layer_account_for_operator(
+    request: BaseLayerAccountGenerateRequest,
+) -> dict:
+    return _allocate_base_layer_account_for_operator(request)
+
+
+@app.post("/base-layer/accounts/allocate", include_in_schema=False)
+def allocate_base_layer_account(request: BaseLayerAccountAllocateRequest) -> dict:
+    return _allocate_base_layer_account_for_operator(request)
 
 
 @app.post("/semantic-layers")

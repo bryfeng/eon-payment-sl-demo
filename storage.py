@@ -12,6 +12,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 import core
 
@@ -104,6 +105,22 @@ class SQLiteStorage:
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               FOREIGN KEY(owner_wallet_address) REFERENCES wallets(address)
+            );
+
+            CREATE TABLE IF NOT EXISTS base_layer_account_pool (
+              id TEXT PRIMARY KEY,
+              label TEXT NOT NULL,
+              eon_address TEXT NOT NULL UNIQUE,
+              encrypted_account_json TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'available',
+              assigned_base_layer_account_id TEXT,
+              funding_tx_hash TEXT,
+              funded_amount TEXT,
+              balance_last_checked TEXT,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              assigned_at TEXT,
+              CHECK (status IN ('available', 'reserved', 'assigned', 'disabled', 'drained'))
             );
 
             CREATE TABLE IF NOT EXISTS semantic_layers (
@@ -257,6 +274,7 @@ class SQLiteStorage:
             for table in (
                 "semantic_layers",
                 "base_layer_accounts",
+                "base_layer_account_pool",
                 "verifier_log",
                 "operator_batches",
                 "pending_actions",
@@ -404,6 +422,190 @@ class SQLiteStorage:
                 ),
             )
         return self.get_base_layer_account(record["id"], include_secret=False)
+
+    def import_base_layer_pool_account(self, record: dict) -> dict:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO base_layer_account_pool (
+                  id,
+                  label,
+                  eon_address,
+                  encrypted_account_json,
+                  status,
+                  funding_tx_hash,
+                  funded_amount,
+                  balance_last_checked,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, 'available', ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    record["id"],
+                    record["label"],
+                    record["eon_address"],
+                    record["encrypted_account_json"],
+                    record.get("funding_tx_hash"),
+                    record.get("funded_amount"),
+                    record.get("balance_last_checked"),
+                ),
+            )
+        return self.get_base_layer_pool_account(record["id"])
+
+    def list_base_layer_pool_accounts(self) -> list:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  id,
+                  label,
+                  eon_address,
+                  status,
+                  assigned_base_layer_account_id,
+                  funding_tx_hash,
+                  funded_amount,
+                  balance_last_checked,
+                  created_at,
+                  updated_at,
+                  assigned_at
+                FROM base_layer_account_pool
+                ORDER BY
+                  CASE status
+                    WHEN 'available' THEN 0
+                    WHEN 'reserved' THEN 1
+                    WHEN 'assigned' THEN 2
+                    WHEN 'disabled' THEN 3
+                    ELSE 4
+                  END,
+                  created_at,
+                  label,
+                  id
+                """
+            ).fetchall()
+        return [self._pool_row_to_dict(row) for row in rows]
+
+    def get_base_layer_pool_account(self, account_id: str) -> Optional[dict]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  id,
+                  label,
+                  eon_address,
+                  status,
+                  assigned_base_layer_account_id,
+                  funding_tx_hash,
+                  funded_amount,
+                  balance_last_checked,
+                  created_at,
+                  updated_at,
+                  assigned_at
+                FROM base_layer_account_pool
+                WHERE id = ?
+                """,
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._pool_row_to_dict(row)
+
+    def base_layer_account_pool_counts(self) -> dict:
+        counts = {
+            "available": 0,
+            "reserved": 0,
+            "assigned": 0,
+            "disabled": 0,
+            "drained": 0,
+            "total": 0,
+        }
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM base_layer_account_pool
+                GROUP BY status
+                """
+            ).fetchall()
+        for row in rows:
+            status = row["status"]
+            count = int(row["count"])
+            counts[status] = count
+            counts["total"] += count
+        return counts
+
+    def allocate_base_layer_account(
+        self,
+        owner_wallet_address: str,
+        label: Optional[str] = None,
+    ) -> Optional[dict]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  id,
+                  label,
+                  eon_address,
+                  encrypted_account_json
+                FROM base_layer_account_pool
+                WHERE status = 'available'
+                ORDER BY created_at, label, id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                return None
+
+            account_id = f"acct_{uuid4().hex[:12]}"
+            account_label = (label or row["label"]).strip()
+            conn.execute(
+                """
+                INSERT INTO base_layer_accounts (
+                  id,
+                  owner_wallet_address,
+                  label,
+                  eon_address,
+                  encrypted_account_json,
+                  updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    account_id,
+                    owner_wallet_address,
+                    account_label,
+                    row["eon_address"],
+                    row["encrypted_account_json"],
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE base_layer_account_pool
+                SET
+                  status = 'assigned',
+                  assigned_base_layer_account_id = ?,
+                  assigned_at = CURRENT_TIMESTAMP,
+                  updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = 'available'
+                """,
+                (account_id, row["id"]),
+            )
+
+        return self.get_base_layer_account(account_id, include_secret=False)
+
+    def _pool_row_to_dict(self, row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "label": row["label"],
+            "eon_address": row["eon_address"],
+            "status": row["status"],
+            "assigned_base_layer_account_id": row["assigned_base_layer_account_id"],
+            "funding_tx_hash": row["funding_tx_hash"],
+            "funded_amount": row["funded_amount"],
+            "balance_last_checked": row["balance_last_checked"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "assigned_at": row["assigned_at"],
+        }
 
     def list_base_layer_accounts(self) -> list:
         with self.connect() as conn:

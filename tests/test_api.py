@@ -232,6 +232,130 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("owner wallet", response.json()["detail"])
 
+    def test_base_layer_account_pool_imports_prefunded_account(self):
+        os.environ["EON_KEY_ENCRYPTION_SECRET"] = "test encryption secret"
+
+        response = self.client.post(
+            "/base-layer/account-pool",
+            json={
+                "label": "Prefunded Poster 1",
+                "account_json": self._account_json("0x" + "3" * 64),
+                "funding_tx_hash": "0xfunding",
+                "funded_amount": "1000000",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        account = response.json()
+        self.assertEqual(account["label"], "Prefunded Poster 1")
+        self.assertEqual(account["eon_address"], "0x" + "3" * 64)
+        self.assertEqual(account["status"], "available")
+        self.assertEqual(account["funding_tx_hash"], "0xfunding")
+        self.assertNotIn("account_json", account)
+        self.assertNotIn("encrypted_account_json", account)
+
+        response = self.client.get("/base-layer/account-pool")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["counts"]["available"], 1)
+        self.assertEqual(response.json()["counts"]["total"], 1)
+
+        status = self.client.get("/devnet/status")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["account_generator_configured"])
+
+    def test_base_layer_account_pool_rejects_duplicate_eon_address(self):
+        os.environ["EON_KEY_ENCRYPTION_SECRET"] = "test encryption secret"
+        payload = {
+            "label": "Prefunded Poster",
+            "account_json": self._account_json("0x" + "3" * 64),
+        }
+        response = self.client.post("/base-layer/account-pool", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post("/base-layer/account-pool", json=payload)
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("already exists", response.json()["detail"])
+
+    def test_base_layer_account_allocation_assigns_available_pool_account(self):
+        operator = self._operator_wallet()
+        os.environ["EON_KEY_ENCRYPTION_SECRET"] = "test encryption secret"
+        pool_response = self.client.post(
+            "/base-layer/account-pool",
+            json={
+                "label": "Prefunded Poster",
+                "account_json": self._account_json("0x" + "3" * 64),
+            },
+        )
+        self.assertEqual(pool_response.status_code, 200, pool_response.text)
+
+        response = self.client.post(
+            "/base-layer/accounts/generate",
+            json={
+                "label": "Assigned Poster",
+                "owner_wallet_address": operator["address"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        assigned = response.json()
+        self.assertEqual(assigned["owner_wallet_address"], operator["address"])
+        self.assertEqual(assigned["label"], "Assigned Poster")
+        self.assertEqual(assigned["eon_address"], "0x" + "3" * 64)
+        self.assertNotIn("account_json", assigned)
+
+        stored = api.STORE.get_base_layer_account(assigned["id"], include_secret=True)
+        self.assertIsNotNone(stored)
+        self.assertNotIn("rng_seed", stored["encrypted_account_json"])
+
+        pool = self.client.get("/base-layer/account-pool")
+        self.assertEqual(pool.status_code, 200, pool.text)
+        pool_account = pool.json()["accounts"][0]
+        self.assertEqual(pool_account["status"], "assigned")
+        self.assertEqual(pool_account["assigned_base_layer_account_id"], assigned["id"])
+
+        status = self.client.get("/devnet/status")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertEqual(status.json()["base_layer_account_count"], 1)
+        self.assertFalse(status.json()["account_generator_configured"])
+
+    def test_base_layer_account_allocation_requires_operator_wallet(self):
+        user = self._wallet("Alice", "alice_vk")
+        os.environ["EON_KEY_ENCRYPTION_SECRET"] = "test encryption secret"
+        response = self.client.post(
+            "/base-layer/account-pool",
+            json={
+                "label": "Prefunded Poster",
+                "account_json": self._account_json("0x" + "3" * 64),
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(
+            "/base-layer/accounts/generate",
+            json={
+                "label": "Assigned Poster",
+                "owner_wallet_address": user["address"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("kind=sl_operator", response.json()["detail"])
+
+    def test_base_layer_account_allocation_requires_available_pool_account(self):
+        operator = self._operator_wallet()
+
+        response = self.client.post(
+            "/base-layer/accounts/generate",
+            json={
+                "label": "Assigned Poster",
+                "owner_wallet_address": operator["address"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("temporarily unavailable", response.json()["detail"])
+
     def test_semantic_layer_records_can_be_created_and_listed(self):
         operator = self._operator_wallet()
         base_account = self._base_layer_account(operator)

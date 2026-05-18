@@ -127,6 +127,9 @@ Without `EON_DEVNET_SUBMIT_CMD` and a bound base-layer account, the API reports
 devnet submission as unconfigured instead of pretending that local scalar
 encoding wrote to the base layer.
 
+`POST /base-layer/accounts/generate` provisions a base-layer posting account for
+an SL operator and stores the signing material encrypted for later submission.
+
 For local workspace testing with the sibling `eon-sdk` checkout, the command can
 point at the generic submitter example:
 
@@ -136,7 +139,7 @@ export EON_DEVNET_SUBMIT_CMD="cargo run --quiet --manifest-path /path/to/eon-sdk
 ```
 
 `EON_OPERATOR_WALLET_FILE` is still supported as a local fallback. The hosted
-workbench path should use `POST /base-layer/accounts` plus
+workbench path should use `POST /base-layer/accounts/generate` and
 `POST /semantic-layers` instead, letting the API decrypt the selected account to
 a temporary file only for the submitter subprocess.
 
