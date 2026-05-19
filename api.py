@@ -407,6 +407,50 @@ def _version_hex(version: str) -> str:
     return raw.hex()
 
 
+def _layer_coordinates(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> tuple[bytes, bytes]:
+    sl_id_bytes = _sl_id_bytes(sl_id) if sl_id else core.SL_ID
+    version_bytes = bytes.fromhex(_version_hex(version)) if version else core.VERSION
+    return sl_id_bytes, version_bytes
+
+
+def _verified_state_for_layer(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> tuple[core.State, bytes, bytes]:
+    sl_id_bytes, version_bytes = _layer_coordinates(sl_id, version)
+    if sl_id_bytes != PAYMENT_PLUGIN.sl_id or version_bytes not in PAYMENT_PLUGIN.supported_versions:
+        raise HTTPException(status_code=404, detail="no verifier state found for semantic layer")
+
+    checkpoint = _verifier_store().load_checkpoint(sl_id_bytes, version_bytes)
+    if checkpoint is not None:
+        return PAYMENT_PLUGIN.state_from_dict(checkpoint["state"]), sl_id_bytes, version_bytes
+
+    legacy_state = STORE.load_verified_state()
+    if legacy_state is not None:
+        return legacy_state, sl_id_bytes, version_bytes
+
+    raise HTTPException(status_code=404, detail="no verifier state found for semantic layer")
+
+
+def _operator_state_for_layer(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> tuple[core.State, bytes, bytes]:
+    state = _operator_state()
+    sl_id_bytes, version_bytes = _layer_coordinates(sl_id, version)
+    config = STORE.load_sl_config()
+    active_sl_id = _sl_id_bytes(str(config.get("sl_id", core.SL_ID.hex())))
+    active_version = bytes.fromhex(_version_hex(str(config.get("version", core.VERSION.hex()))))
+
+    if sl_id_bytes != active_sl_id or version_bytes != active_version:
+        raise HTTPException(status_code=404, detail="no operator state found for semantic layer")
+
+    return state, sl_id_bytes, version_bytes
+
+
 def _model_to_dict(model: BaseModel) -> dict:
     if hasattr(model, "model_dump"):
         return model.model_dump(exclude_none=True)
@@ -767,15 +811,22 @@ def list_semantic_layers() -> dict:
 def get_balance(
     address: str,
     source: str = Query(default="verifier", pattern="^(verifier|operator)$"),
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
 ) -> dict:
     addr = _validate_address(address)
-    state = _verified_state() if source == "verifier" else _operator_state()
+    if source == "verifier":
+        state, resolved_sl_id, resolved_version = _verified_state_for_layer(sl_id, version)
+    else:
+        state, resolved_sl_id, resolved_version = _operator_state_for_layer(sl_id, version)
     return {
         "address": addr,
         "balance": state.get_balance(addr),
         "frozen": addr in state.frozen,
         "source": source,
         "state_hash": state.state_hash(),
+        "sl_id": resolved_sl_id.hex(),
+        "version": resolved_version.hex(),
     }
 
 

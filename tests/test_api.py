@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import api  # noqa: E402
-from core import SL_ID, hash_vk  # noqa: E402
+from core import SL_ID, VERSION, hash_vk  # noqa: E402
 
 
 class ApiTests(unittest.TestCase):
@@ -114,6 +114,12 @@ class ApiTests(unittest.TestCase):
         self.assertIn("payload_hex", batch)
         self.assertIn("data_scalars", batch)
 
+        response = self.client.get(
+            f"/balances/{alice['address']}?source=operator&sl_id={SL_ID.hex()}&version={VERSION.hex()}"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["balance"], 100)
+
         response = self.client.post("/verifier/accept-latest-batch")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["sequence"], 1)
@@ -122,6 +128,19 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["balance"], 100)
         self.assertEqual(response.json()["source"], "verifier")
+        self.assertEqual(response.json()["sl_id"], SL_ID.hex())
+        self.assertEqual(response.json()["version"], VERSION.hex())
+
+        response = self.client.get(
+            f"/balances/{alice['address']}?source=verifier&sl_id={SL_ID.hex()}&version={VERSION.hex()}"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["balance"], 100)
+
+        response = self.client.get(
+            f"/balances/{alice['address']}?source=verifier&sl_id=00010002&version={VERSION.hex()}"
+        )
+        self.assertEqual(response.status_code, 404)
 
         response = self.client.post(
             "/actions/transfer",
