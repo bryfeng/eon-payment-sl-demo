@@ -195,6 +195,7 @@ Register encrypted EON account JSON for a wallet identity:
 {
   "label": "Payment SL poster",
   "owner_wallet_address": "40_hex_chars",
+  "purpose": "sl_operator",
   "eon_address": "0x64_hex_chars",
   "account_json": {
     "account_type": "normal",
@@ -208,18 +209,21 @@ Register encrypted EON account JSON for a wallet identity:
 API encrypts the JSON with `EON_KEY_ENCRYPTION_SECRET` before writing SQLite and
 never returns plaintext account material through API responses.
 
-Generate and store a base-layer signing account for an SL operator:
+Generate and store a base-layer signing account for a registered wallet:
 
 ```json
 {
-  "label": "Payment SL poster",
-  "owner_wallet_address": "40_hex_chars"
+  "label": "Alice base account",
+  "owner_wallet_address": "40_hex_chars",
+  "purpose": "user_wallet"
 }
 ```
 
 `POST /base-layer/accounts/generate` returns an assigned account id and EON
-address for the operator wallet. Use that id as `base_layer_account_id` when
-registering a semantic-layer record.
+address for the wallet. `purpose` defaults from wallet kind: `user` maps to
+`user_wallet`, while `sl_operator`, `coordinator`, and `verifier` map directly.
+For semantic-layer operator records, use the returned `sl_operator` account id
+as `base_layer_account_id`.
 
 ### Semantic Layer Registry
 

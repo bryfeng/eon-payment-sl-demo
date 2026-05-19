@@ -79,6 +79,9 @@ class SemanticLayerRequest(BaseModel):
 class BaseLayerAccountRequest(BaseModel):
     label: str = Field(min_length=1)
     owner_wallet_address: str
+    purpose: Optional[
+        Literal["user_wallet", "sl_operator", "coordinator", "verifier"]
+    ] = None
     eon_address: Optional[str] = None
     account_json: dict[str, Any]
 
@@ -95,6 +98,9 @@ class BaseLayerAccountPoolRequest(BaseModel):
 class BaseLayerAccountAllocateRequest(BaseModel):
     label: Optional[str] = None
     owner_wallet_address: str
+    purpose: Optional[
+        Literal["user_wallet", "sl_operator", "coordinator", "verifier"]
+    ] = None
 
 
 class BaseLayerAccountGenerateRequest(BaseLayerAccountAllocateRequest):
@@ -199,6 +205,7 @@ def _public_base_layer_account(record: dict) -> dict:
         "id": record["id"],
         "owner_wallet_address": record["owner_wallet_address"],
         "label": record["label"],
+        "purpose": record.get("purpose", "sl_operator"),
         "eon_address": record["eon_address"],
         "created_at": record.get("created_at"),
         "updated_at": record.get("updated_at"),
@@ -226,11 +233,13 @@ def _store_base_layer_account(
     owner_wallet_address: str,
     account_json: dict[str, Any],
     eon_address: Optional[str] = None,
+    purpose: Optional[str] = None,
 ) -> dict:
     owner_address = _validate_address(owner_wallet_address)
     owner_wallet = STORE.get_wallet(owner_address)
     if not owner_wallet:
         raise HTTPException(status_code=400, detail="owner wallet is not registered")
+    account_purpose = _resolve_base_layer_account_purpose(owner_wallet, purpose)
 
     json_address = _account_json_address(account_json)
     requested_address = _validate_eon_address(eon_address) if eon_address else json_address
@@ -254,6 +263,7 @@ def _store_base_layer_account(
         "id": f"acct_{uuid4().hex[:12]}",
         "owner_wallet_address": owner_address,
         "label": label.strip(),
+        "purpose": account_purpose,
         "eon_address": requested_address,
         "encrypted_account_json": encrypted_account_json,
     }
@@ -299,6 +309,27 @@ def _store_base_layer_pool_account(request: BaseLayerAccountPoolRequest) -> dict
             detail="base-layer account already exists in the pool",
         ) from e
     return _public_base_layer_pool_account(created)
+
+
+def _default_account_purpose_for_wallet_kind(kind: str) -> str:
+    if kind == "user":
+        return "user_wallet"
+    if kind in {"sl_operator", "coordinator", "verifier"}:
+        return kind
+    raise HTTPException(status_code=400, detail="unsupported wallet kind")
+
+
+def _resolve_base_layer_account_purpose(
+    wallet: dict,
+    requested_purpose: Optional[str],
+) -> str:
+    expected = _default_account_purpose_for_wallet_kind(wallet.get("kind", "user"))
+    if requested_purpose and requested_purpose != expected:
+        raise HTTPException(
+            status_code=400,
+            detail=f"purpose must be {expected} for wallet kind={wallet.get('kind', 'user')}",
+        )
+    return requested_purpose or expected
 
 
 def _state_to_response(state: core.State) -> dict:
@@ -604,6 +635,7 @@ def register_base_layer_account(request: BaseLayerAccountRequest) -> dict:
             request.owner_wallet_address,
             request.account_json,
             request.eon_address,
+            request.purpose,
         )
 
 
@@ -634,7 +666,7 @@ def list_base_layer_pool_accounts() -> dict:
     }
 
 
-def _allocate_base_layer_account_for_operator(
+def _allocate_base_layer_account_for_wallet(
     request: BaseLayerAccountAllocateRequest,
 ) -> dict:
     with STATE_LOCK:
@@ -642,14 +674,14 @@ def _allocate_base_layer_account_for_operator(
         owner_wallet = STORE.get_wallet(owner_address)
         if not owner_wallet:
             raise HTTPException(status_code=400, detail="owner wallet is not registered")
-        if owner_wallet.get("kind") != "sl_operator":
-            raise HTTPException(
-                status_code=400,
-                detail="owner wallet must use kind=sl_operator",
-            )
+        account_purpose = _resolve_base_layer_account_purpose(
+            owner_wallet,
+            request.purpose,
+        )
 
         account = STORE.allocate_base_layer_account(
             owner_address,
+            account_purpose,
             request.label.strip() if request.label else None,
         )
         if not account:
@@ -661,15 +693,15 @@ def _allocate_base_layer_account_for_operator(
 
 
 @app.post("/base-layer/accounts/generate")
-def generate_base_layer_account_for_operator(
+def generate_base_layer_account_for_wallet(
     request: BaseLayerAccountGenerateRequest,
 ) -> dict:
-    return _allocate_base_layer_account_for_operator(request)
+    return _allocate_base_layer_account_for_wallet(request)
 
 
 @app.post("/base-layer/accounts/allocate", include_in_schema=False)
 def allocate_base_layer_account(request: BaseLayerAccountAllocateRequest) -> dict:
-    return _allocate_base_layer_account_for_operator(request)
+    return _allocate_base_layer_account_for_wallet(request)
 
 
 @app.post("/semantic-layers")
@@ -706,6 +738,11 @@ def register_semantic_layer(request: SemanticLayerRequest) -> dict:
                 raise HTTPException(
                     status_code=400,
                     detail="base-layer account must belong to operator wallet",
+                )
+            if base_layer_account.get("purpose") != "sl_operator":
+                raise HTTPException(
+                    status_code=400,
+                    detail="semantic-layer base account must use purpose=sl_operator",
                 )
 
         record = {

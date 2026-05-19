@@ -202,6 +202,7 @@ class ApiTests(unittest.TestCase):
 
         self.assertEqual(account["owner_wallet_address"], operator["address"])
         self.assertEqual(account["eon_address"], "0x" + "1" * 64)
+        self.assertEqual(account["purpose"], "sl_operator")
         self.assertNotIn("account_json", account)
         self.assertNotIn("encrypted_account_json", account)
 
@@ -214,6 +215,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         listed = response.json()["accounts"][0]
         self.assertEqual(listed["id"], account["id"])
+        self.assertEqual(listed["purpose"], "sl_operator")
         self.assertNotIn("account_json", listed)
         self.assertNotIn("encrypted_account_json", listed)
 
@@ -301,6 +303,7 @@ class ApiTests(unittest.TestCase):
         assigned = response.json()
         self.assertEqual(assigned["owner_wallet_address"], operator["address"])
         self.assertEqual(assigned["label"], "Assigned Poster")
+        self.assertEqual(assigned["purpose"], "sl_operator")
         self.assertEqual(assigned["eon_address"], "0x" + "3" * 64)
         self.assertNotIn("account_json", assigned)
 
@@ -319,7 +322,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status.json()["base_layer_account_count"], 1)
         self.assertFalse(status.json()["account_generator_configured"])
 
-    def test_base_layer_account_allocation_requires_operator_wallet(self):
+    def test_base_layer_account_generation_supports_user_wallets(self):
         user = self._wallet("Alice", "alice_vk")
         os.environ["EON_KEY_ENCRYPTION_SECRET"] = "test encryption secret"
         response = self.client.post(
@@ -334,13 +337,41 @@ class ApiTests(unittest.TestCase):
         response = self.client.post(
             "/base-layer/accounts/generate",
             json={
-                "label": "Assigned Poster",
+                "label": "Alice Base Account",
                 "owner_wallet_address": user["address"],
+                "purpose": "user_wallet",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        assigned = response.json()
+        self.assertEqual(assigned["owner_wallet_address"], user["address"])
+        self.assertEqual(assigned["purpose"], "user_wallet")
+        self.assertEqual(assigned["label"], "Alice Base Account")
+
+    def test_base_layer_account_generation_rejects_purpose_kind_mismatch(self):
+        user = self._wallet("Alice", "alice_vk")
+        os.environ["EON_KEY_ENCRYPTION_SECRET"] = "test encryption secret"
+        response = self.client.post(
+            "/base-layer/account-pool",
+            json={
+                "label": "Prefunded Poster",
+                "account_json": self._account_json("0x" + "3" * 64),
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(
+            "/base-layer/accounts/generate",
+            json={
+                "label": "Wrong Purpose",
+                "owner_wallet_address": user["address"],
+                "purpose": "sl_operator",
             },
         )
 
         self.assertEqual(response.status_code, 400)
-        self.assertIn("kind=sl_operator", response.json()["detail"])
+        self.assertIn("purpose must be user_wallet", response.json()["detail"])
 
     def test_base_layer_account_allocation_requires_available_pool_account(self):
         operator = self._operator_wallet()

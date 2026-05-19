@@ -100,6 +100,7 @@ class SQLiteStorage:
               id TEXT PRIMARY KEY,
               owner_wallet_address TEXT NOT NULL,
               label TEXT NOT NULL,
+              purpose TEXT NOT NULL DEFAULT 'sl_operator',
               eon_address TEXT NOT NULL,
               encrypted_account_json TEXT NOT NULL,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -176,6 +177,15 @@ class SQLiteStorage:
         }
         if "base_layer_account_id" not in semantic_layer_columns:
             conn.execute("ALTER TABLE semantic_layers ADD COLUMN base_layer_account_id TEXT")
+        base_layer_account_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(base_layer_accounts)").fetchall()
+        }
+        if "purpose" not in base_layer_account_columns:
+            conn.execute(
+                "ALTER TABLE base_layer_accounts "
+                "ADD COLUMN purpose TEXT NOT NULL DEFAULT 'sl_operator'"
+            )
 
     def _record_devnet_submission(
         self,
@@ -407,16 +417,18 @@ class SQLiteStorage:
                   id,
                   owner_wallet_address,
                   label,
+                  purpose,
                   eon_address,
                   encrypted_account_json,
                   updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     record["id"],
                     record["owner_wallet_address"],
                     record["label"],
+                    record.get("purpose", "sl_operator"),
                     record["eon_address"],
                     record["encrypted_account_json"],
                 ),
@@ -536,6 +548,7 @@ class SQLiteStorage:
     def allocate_base_layer_account(
         self,
         owner_wallet_address: str,
+        purpose: str,
         label: Optional[str] = None,
     ) -> Optional[dict]:
         with self.connect() as conn:
@@ -563,16 +576,18 @@ class SQLiteStorage:
                   id,
                   owner_wallet_address,
                   label,
+                  purpose,
                   eon_address,
                   encrypted_account_json,
                   updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """,
                 (
                     account_id,
                     owner_wallet_address,
                     account_label,
+                    purpose,
                     row["eon_address"],
                     row["encrypted_account_json"],
                 ),
@@ -615,6 +630,7 @@ class SQLiteStorage:
                   id,
                   owner_wallet_address,
                   label,
+                  purpose,
                   eon_address,
                   created_at,
                   updated_at
@@ -627,6 +643,7 @@ class SQLiteStorage:
                 "id": row["id"],
                 "owner_wallet_address": row["owner_wallet_address"],
                 "label": row["label"],
+                "purpose": row["purpose"],
                 "eon_address": row["eon_address"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
@@ -650,6 +667,7 @@ class SQLiteStorage:
           id,
           owner_wallet_address,
           label,
+          purpose,
           eon_address,
           encrypted_account_json,
           created_at,
@@ -667,6 +685,7 @@ class SQLiteStorage:
             "id": row["id"],
             "owner_wallet_address": row["owner_wallet_address"],
             "label": row["label"],
+            "purpose": row["purpose"],
             "eon_address": row["eon_address"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],

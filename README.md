@@ -127,8 +127,10 @@ Without `EON_DEVNET_SUBMIT_CMD` and a bound base-layer account, the API reports
 devnet submission as unconfigured instead of pretending that local scalar
 encoding wrote to the base layer.
 
-`POST /base-layer/accounts/generate` provisions a base-layer posting account for
-an SL operator and stores the signing material encrypted for later submission.
+`POST /base-layer/accounts/generate` provisions a base-layer account for a
+registered user, SL operator, coordinator, or verifier wallet and stores the
+signing material encrypted for later submission. User accounts use
+`purpose=user_wallet`; SL operator posting accounts use `purpose=sl_operator`.
 
 For local workspace testing with the sibling `eon-sdk` checkout, the command can
 point at the generic submitter example:
