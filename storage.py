@@ -233,6 +233,7 @@ class SQLiteStorage:
                 "ADD COLUMN purpose TEXT NOT NULL DEFAULT 'sl_operator'"
             )
         self._migrate_legacy_runtime(conn)
+        self._hydrate_runtime_metadata_from_registry(conn)
 
     def _record_devnet_submission(
         self,
@@ -470,6 +471,35 @@ class SQLiteStorage:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def _hydrate_runtime_metadata_from_registry(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            SELECT
+              c.sl_id,
+              c.version,
+              c.issuer_vk,
+              c.next_sequence,
+              s.operator_wallet_address,
+              s.base_layer_account_id
+            FROM sl_runtime_configs c
+            JOIN semantic_layers s
+              ON s.sl_id = c.sl_id AND s.version = c.version
+            WHERE c.operator_wallet_address IS NULL
+               OR c.base_layer_account_id IS NULL
+            """
+        ).fetchall()
+
+        for row in rows:
+            self._put_runtime_config(
+                conn,
+                row["sl_id"],
+                row["version"],
+                row["issuer_vk"],
+                operator_wallet_address=row["operator_wallet_address"],
+                base_layer_account_id=row["base_layer_account_id"],
+                next_sequence=int(row["next_sequence"]),
+            )
 
     def _migrate_legacy_runtime(self, conn: sqlite3.Connection) -> None:
         sl_id = core.SL_ID.hex()
@@ -1112,6 +1142,17 @@ class SQLiteStorage:
                     record.get("operator_vk_ref"),
                 ),
             )
+            config = self._get_runtime_config(conn, record["sl_id"], record["version"])
+            if config is not None:
+                self._put_runtime_config(
+                    conn,
+                    record["sl_id"],
+                    record["version"],
+                    config["issuer_vk"],
+                    operator_wallet_address=record["operator_wallet_address"],
+                    base_layer_account_id=record.get("base_layer_account_id"),
+                    next_sequence=int(config["next_sequence"]),
+                )
 
     def get_semantic_layer(self, sl_id: str) -> Optional[dict]:
         with self.connect() as conn:

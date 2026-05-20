@@ -524,6 +524,31 @@ class ApiTests(unittest.TestCase):
             base_account["id"],
         )
 
+    def test_semantic_layer_record_hydrates_existing_runtime_metadata(self):
+        self._init()
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": operator["address"],
+                "base_layer_account_id": base_account["id"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get("/config")
+        self.assertEqual(response.status_code, 200, response.text)
+        runtimes = response.json()["runtimes"]
+        self.assertEqual(len(runtimes), 1)
+        self.assertEqual(runtimes[0]["operator_wallet_address"], operator["address"])
+        self.assertEqual(runtimes[0]["base_layer_account_id"], base_account["id"])
+        self.assertEqual(runtimes[0]["next_sequence"], 1)
+
     def test_semantic_layer_rejects_invalid_operator_address(self):
         response = self.client.post(
             "/semantic-layers",
