@@ -161,6 +161,52 @@ class SQLiteStorage:
               new_state_hash TEXT NOT NULL,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+
+            CREATE TABLE IF NOT EXISTS sl_runtime_configs (
+              sl_id TEXT NOT NULL,
+              version TEXT NOT NULL,
+              issuer_vk TEXT NOT NULL,
+              operator_wallet_address TEXT,
+              base_layer_account_id TEXT,
+              next_sequence INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(sl_id, version)
+            );
+
+            CREATE TABLE IF NOT EXISTS sl_states (
+              sl_id TEXT NOT NULL,
+              version TEXT NOT NULL,
+              scope TEXT NOT NULL,
+              state_json TEXT NOT NULL,
+              state_hash TEXT NOT NULL,
+              nonce INTEGER NOT NULL,
+              total_supply INTEGER NOT NULL,
+              updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              CHECK (scope IN ('operator', 'verifier')),
+              PRIMARY KEY(sl_id, version, scope)
+            );
+
+            CREATE TABLE IF NOT EXISTS sl_pending_actions (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              sl_id TEXT NOT NULL,
+              version TEXT NOT NULL,
+              action_json TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS sl_operator_batches (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              sl_id TEXT NOT NULL,
+              version TEXT NOT NULL,
+              sequence INTEGER NOT NULL,
+              record_json TEXT NOT NULL,
+              payload_hex TEXT NOT NULL,
+              prev_state_hash TEXT NOT NULL,
+              new_state_hash TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              UNIQUE(sl_id, version, sequence)
+            );
             """
         )
         wallet_columns = {
@@ -186,16 +232,22 @@ class SQLiteStorage:
                 "ALTER TABLE base_layer_accounts "
                 "ADD COLUMN purpose TEXT NOT NULL DEFAULT 'sl_operator'"
             )
+        self._migrate_legacy_runtime(conn)
 
     def _record_devnet_submission(
         self,
         conn: sqlite3.Connection,
         sequence: int,
         submission: dict,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
     ) -> dict:
         row = conn.execute(
-            "SELECT record_json FROM operator_batches WHERE sequence = ?",
-            (sequence,),
+            """
+            SELECT record_json FROM sl_operator_batches
+            WHERE sl_id = ? AND version = ? AND sequence = ?
+            """,
+            (sl_id, version, sequence),
         ).fetchone()
         if row is None:
             raise KeyError(f"batch {sequence} not found")
@@ -204,12 +256,28 @@ class SQLiteStorage:
         record["devnet_submission"] = submission
         conn.execute(
             """
-            UPDATE operator_batches
+            UPDATE sl_operator_batches
             SET record_json = ?
-            WHERE sequence = ?
+            WHERE sl_id = ? AND version = ? AND sequence = ?
             """,
-            (_dumps(record), sequence),
+            (_dumps(record), sl_id, version, sequence),
         )
+        if sl_id == core.SL_ID.hex() and version == core.VERSION.hex():
+            legacy_row = conn.execute(
+                "SELECT record_json FROM operator_batches WHERE sequence = ?",
+                (sequence,),
+            ).fetchone()
+            if legacy_row is not None:
+                legacy_record = _loads(legacy_row["record_json"])
+                legacy_record["devnet_submission"] = submission
+                conn.execute(
+                    """
+                    UPDATE operator_batches
+                    SET record_json = ?
+                    WHERE sequence = ?
+                    """,
+                    (_dumps(legacy_record), sequence),
+                )
         return record
 
     def _put_json(self, conn: sqlite3.Connection, key: str, value: Any) -> None:
@@ -279,9 +347,210 @@ class SQLiteStorage:
             return None
         return core.State.from_dict(_loads(row["state_json"]))
 
+    def _put_scoped_state(
+        self,
+        conn: sqlite3.Connection,
+        sl_id: str,
+        version: str,
+        scope: str,
+        state: core.State,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO sl_states (
+              sl_id, version, scope, state_json, state_hash, nonce, total_supply, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(sl_id, version, scope) DO UPDATE SET
+              state_json = excluded.state_json,
+              state_hash = excluded.state_hash,
+              nonce = excluded.nonce,
+              total_supply = excluded.total_supply,
+              updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                sl_id,
+                version,
+                scope,
+                _dumps(state.to_dict()),
+                state.state_hash(),
+                state.nonce,
+                state.total_supply,
+            ),
+        )
+
+    def _get_scoped_state(
+        self,
+        conn: sqlite3.Connection,
+        sl_id: str,
+        version: str,
+        scope: str,
+    ) -> Optional[core.State]:
+        row = conn.execute(
+            """
+            SELECT state_json FROM sl_states
+            WHERE sl_id = ? AND version = ? AND scope = ?
+            """,
+            (sl_id, version, scope),
+        ).fetchone()
+        if row is None:
+            return None
+        return core.State.from_dict(_loads(row["state_json"]))
+
+    def _put_runtime_config(
+        self,
+        conn: sqlite3.Connection,
+        sl_id: str,
+        version: str,
+        issuer_vk: str,
+        operator_wallet_address: Optional[str] = None,
+        base_layer_account_id: Optional[str] = None,
+        next_sequence: int = 1,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO sl_runtime_configs (
+              sl_id,
+              version,
+              issuer_vk,
+              operator_wallet_address,
+              base_layer_account_id,
+              next_sequence,
+              updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(sl_id, version) DO UPDATE SET
+              issuer_vk = excluded.issuer_vk,
+              operator_wallet_address = COALESCE(excluded.operator_wallet_address, sl_runtime_configs.operator_wallet_address),
+              base_layer_account_id = COALESCE(excluded.base_layer_account_id, sl_runtime_configs.base_layer_account_id),
+              next_sequence = excluded.next_sequence,
+              updated_at = CURRENT_TIMESTAMP
+            """,
+            (
+                sl_id,
+                version,
+                issuer_vk,
+                operator_wallet_address,
+                base_layer_account_id,
+                next_sequence,
+            ),
+        )
+
+    def _get_runtime_config(
+        self,
+        conn: sqlite3.Connection,
+        sl_id: str,
+        version: str,
+    ) -> Optional[dict]:
+        row = conn.execute(
+            """
+            SELECT
+              sl_id,
+              version,
+              issuer_vk,
+              operator_wallet_address,
+              base_layer_account_id,
+              next_sequence,
+              created_at,
+              updated_at
+            FROM sl_runtime_configs
+            WHERE sl_id = ? AND version = ?
+            """,
+            (sl_id, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "sl_id": row["sl_id"],
+            "version": row["version"],
+            "issuer_vk": row["issuer_vk"],
+            "operator_wallet_address": row["operator_wallet_address"],
+            "base_layer_account_id": row["base_layer_account_id"],
+            "next_sequence": int(row["next_sequence"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _migrate_legacy_runtime(self, conn: sqlite3.Connection) -> None:
+        sl_id = core.SL_ID.hex()
+        version = core.VERSION.hex()
+        existing = self._get_runtime_config(conn, sl_id, version)
+        if existing is not None:
+            return
+
+        legacy_config = self._get_json(conn, "sl_config")
+        legacy_operator = self._get_state(conn, "operator")
+        if legacy_config is None or legacy_operator is None:
+            return
+
+        meta = self._get_json(conn, "operator_meta", {"next_sequence": 1})
+        legacy_sl_id = str(legacy_config.get("sl_id", sl_id))
+        legacy_version = str(legacy_config.get("version", version))
+        self._put_runtime_config(
+            conn,
+            legacy_sl_id,
+            legacy_version,
+            str(legacy_config["issuer_vk"]),
+            next_sequence=int(meta.get("next_sequence", 1)),
+        )
+        self._put_scoped_state(conn, legacy_sl_id, legacy_version, "operator", legacy_operator)
+
+        legacy_verifier = self._get_state(conn, "verifier")
+        if legacy_verifier is not None:
+            self._put_scoped_state(conn, legacy_sl_id, legacy_version, "verifier", legacy_verifier)
+
+        pending_rows = conn.execute(
+            "SELECT action_json, created_at FROM pending_actions ORDER BY id"
+        ).fetchall()
+        for row in pending_rows:
+            conn.execute(
+                """
+                INSERT INTO sl_pending_actions (sl_id, version, action_json, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (legacy_sl_id, legacy_version, row["action_json"], row["created_at"]),
+            )
+
+        batch_rows = conn.execute(
+            """
+            SELECT sequence, record_json, payload_hex, prev_state_hash, new_state_hash, created_at
+            FROM operator_batches ORDER BY sequence
+            """
+        ).fetchall()
+        for row in batch_rows:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sl_operator_batches (
+                  sl_id,
+                  version,
+                  sequence,
+                  record_json,
+                  payload_hex,
+                  prev_state_hash,
+                  new_state_hash,
+                  created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    legacy_sl_id,
+                    legacy_version,
+                    int(row["sequence"]),
+                    row["record_json"],
+                    row["payload_hex"],
+                    row["prev_state_hash"],
+                    row["new_state_hash"],
+                    row["created_at"],
+                ),
+            )
+
     def reset(self) -> None:
         with self.connect() as conn:
             for table in (
+                "sl_operator_batches",
+                "sl_pending_actions",
+                "sl_states",
+                "sl_runtime_configs",
                 "semantic_layers",
                 "base_layer_accounts",
                 "base_layer_account_pool",
@@ -293,79 +562,194 @@ class SQLiteStorage:
                 "kv",
             ):
                 conn.execute(f"DELETE FROM {table}")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'sl_pending_actions'")
+            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'sl_operator_batches'")
             conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_actions'")
 
-    def initialize(self, issuer_vk: str) -> core.State:
+    def initialize(
+        self,
+        issuer_vk: str,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+        operator_wallet_address: Optional[str] = None,
+        base_layer_account_id: Optional[str] = None,
+        reset_existing: bool = False,
+    ) -> core.State:
         genesis = core.State(issuer_vk=issuer_vk)
         config = {
             "issuer_vk": issuer_vk,
-            "sl_id": core.SL_ID.hex(),
-            "version": core.VERSION.hex(),
+            "sl_id": sl_id,
+            "version": version,
+            "operator_wallet_address": operator_wallet_address,
+            "base_layer_account_id": base_layer_account_id,
         }
 
         with self.connect() as conn:
-            for table in (
-                "verifier_log",
-                "operator_batches",
-                "pending_actions",
-                "states",
-                "kv",
-            ):
-                conn.execute(f"DELETE FROM {table}")
-            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_actions'")
-            self._put_json(conn, "sl_config", config)
-            self._put_json(conn, "operator_meta", {"next_sequence": 1})
-            self._put_state(conn, "operator", genesis)
+            if reset_existing:
+                conn.execute(
+                    "DELETE FROM sl_operator_batches WHERE sl_id = ? AND version = ?",
+                    (sl_id, version),
+                )
+                conn.execute(
+                    "DELETE FROM sl_pending_actions WHERE sl_id = ? AND version = ?",
+                    (sl_id, version),
+                )
+                conn.execute(
+                    "DELETE FROM sl_states WHERE sl_id = ? AND version = ?",
+                    (sl_id, version),
+                )
+                conn.execute(
+                    "DELETE FROM sl_runtime_configs WHERE sl_id = ? AND version = ?",
+                    (sl_id, version),
+                )
+
+            self._put_runtime_config(
+                conn,
+                sl_id,
+                version,
+                issuer_vk,
+                operator_wallet_address=operator_wallet_address,
+                base_layer_account_id=base_layer_account_id,
+                next_sequence=1,
+            )
+            self._put_scoped_state(conn, sl_id, version, "operator", genesis)
+
+            if sl_id == core.SL_ID.hex() and version == core.VERSION.hex():
+                self._put_json(conn, "sl_config", config)
+                self._put_json(conn, "operator_meta", {"next_sequence": 1})
+                self._put_state(conn, "operator", genesis)
 
         return genesis
 
-    def is_initialized(self) -> bool:
+    def is_initialized(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> bool:
         with self.connect() as conn:
-            has_config = self._get_json(conn, "sl_config") is not None
-            has_state = self._get_state(conn, "operator") is not None
+            has_config = self._get_runtime_config(conn, sl_id, version) is not None
+            has_state = self._get_scoped_state(conn, sl_id, version, "operator") is not None
         return bool(has_config and has_state)
 
-    def load_sl_config(self) -> Optional[dict]:
+    def load_sl_config(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> Optional[dict]:
         with self.connect() as conn:
-            return self._get_json(conn, "sl_config")
+            return self._get_runtime_config(conn, sl_id, version)
 
-    def load_operator_state(self) -> Optional[core.State]:
-        with self.connect() as conn:
-            return self._get_state(conn, "operator")
-
-    def load_verified_state(self) -> Optional[core.State]:
-        with self.connect() as conn:
-            return self._get_state(conn, "verifier")
-
-    def load_pending(self) -> list:
+    def list_runtime_configs(self) -> list[dict]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT action_json FROM pending_actions ORDER BY id"
+                """
+                SELECT
+                  sl_id,
+                  version,
+                  issuer_vk,
+                  operator_wallet_address,
+                  base_layer_account_id,
+                  next_sequence,
+                  created_at,
+                  updated_at
+                FROM sl_runtime_configs
+                ORDER BY updated_at DESC, sl_id, version
+                """
+            ).fetchall()
+        return [
+            {
+                "sl_id": row["sl_id"],
+                "version": row["version"],
+                "issuer_vk": row["issuer_vk"],
+                "operator_wallet_address": row["operator_wallet_address"],
+                "base_layer_account_id": row["base_layer_account_id"],
+                "next_sequence": int(row["next_sequence"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    def load_operator_state(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> Optional[core.State]:
+        with self.connect() as conn:
+            return self._get_scoped_state(conn, sl_id, version, "operator")
+
+    def load_verified_state(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> Optional[core.State]:
+        with self.connect() as conn:
+            return self._get_scoped_state(conn, sl_id, version, "verifier")
+
+    def load_pending(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> list:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT action_json FROM sl_pending_actions
+                WHERE sl_id = ? AND version = ?
+                ORDER BY id
+                """,
+                (sl_id, version),
             ).fetchall()
         return [_loads(row["action_json"]) for row in rows]
 
-    def pending_count(self) -> int:
+    def pending_count(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> int:
         with self.connect() as conn:
-            row = conn.execute("SELECT COUNT(*) AS count FROM pending_actions").fetchone()
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count FROM sl_pending_actions
+                WHERE sl_id = ? AND version = ?
+                """,
+                (sl_id, version),
+            ).fetchone()
         return int(row["count"])
 
-    def append_pending(self, action_dict: dict) -> None:
+    def append_pending(
+        self,
+        action_dict: dict,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO pending_actions (action_json) VALUES (?)",
-                (_dumps(action_dict),),
+                """
+                INSERT INTO sl_pending_actions (sl_id, version, action_json)
+                VALUES (?, ?, ?)
+                """,
+                (sl_id, version, _dumps(action_dict)),
             )
 
-    def next_batch_sequence(self) -> int:
+    def next_batch_sequence(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> int:
         with self.connect() as conn:
-            meta = self._get_json(conn, "operator_meta", {"next_sequence": 1})
-        return int(meta.get("next_sequence", 1))
+            config = self._get_runtime_config(conn, sl_id, version)
+        return int((config or {}).get("next_sequence", 1))
 
-    def next_nonce(self) -> int:
-        state = self.load_operator_state()
+    def next_nonce(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> int:
+        state = self.load_operator_state(sl_id, version)
         if state is None:
             raise RuntimeError("operator state is not initialized")
-        return state.nonce + self.pending_count() + 1
+        return state.nonce + self.pending_count(sl_id, version) + 1
 
     def upsert_wallet(self, label: str, address: str, kind: str = "user") -> None:
         with self.connect() as conn:
@@ -795,22 +1179,37 @@ class SQLiteStorage:
             for row in rows
         ]
 
-    def list_batches(self) -> list:
+    def list_batches(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> list:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT record_json FROM operator_batches ORDER BY sequence"
+                """
+                SELECT record_json FROM sl_operator_batches
+                WHERE sl_id = ? AND version = ?
+                ORDER BY sequence
+                """,
+                (sl_id, version),
             ).fetchall()
         return [_loads(row["record_json"]) for row in rows]
 
-    def latest_batch(self) -> Optional[dict]:
+    def latest_batch(
+        self,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> Optional[dict]:
         with self.connect() as conn:
             row = conn.execute(
                 """
                 SELECT record_json
-                FROM operator_batches
+                FROM sl_operator_batches
+                WHERE sl_id = ? AND version = ?
                 ORDER BY sequence DESC
                 LIMIT 1
-                """
+                """,
+                (sl_id, version),
             ).fetchone()
         if row is None:
             return None
@@ -821,24 +1220,44 @@ class SQLiteStorage:
         new_state: core.State,
         record: dict,
         sequence: int,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
     ) -> None:
         with self.connect() as conn:
-            self._put_state(conn, "operator", new_state)
-            conn.execute("DELETE FROM pending_actions")
-            conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_actions'")
-            self._put_json(conn, "operator_meta", {"next_sequence": sequence + 1})
+            config = self._get_runtime_config(conn, sl_id, version)
+            self._put_scoped_state(conn, sl_id, version, "operator", new_state)
             conn.execute(
                 """
-                INSERT INTO operator_batches (
+                DELETE FROM sl_pending_actions
+                WHERE sl_id = ? AND version = ?
+                """,
+                (sl_id, version),
+            )
+            self._put_runtime_config(
+                conn,
+                sl_id,
+                version,
+                new_state.issuer_vk,
+                operator_wallet_address=(config or {}).get("operator_wallet_address"),
+                base_layer_account_id=(config or {}).get("base_layer_account_id"),
+                next_sequence=sequence + 1,
+            )
+            conn.execute(
+                """
+                INSERT INTO sl_operator_batches (
+                  sl_id,
+                  version,
                   sequence,
                   record_json,
                   payload_hex,
                   prev_state_hash,
                   new_state_hash
                 )
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
+                    sl_id,
+                    version,
                     sequence,
                     _dumps(record),
                     record["payload_hex"],
@@ -847,9 +1266,40 @@ class SQLiteStorage:
                 ),
             )
 
-    def record_devnet_submission(self, sequence: int, submission: dict) -> dict:
+            if sl_id == core.SL_ID.hex() and version == core.VERSION.hex():
+                self._put_state(conn, "operator", new_state)
+                conn.execute("DELETE FROM pending_actions")
+                conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_actions'")
+                self._put_json(conn, "operator_meta", {"next_sequence": sequence + 1})
+                conn.execute(
+                    """
+                    INSERT INTO operator_batches (
+                      sequence,
+                      record_json,
+                      payload_hex,
+                      prev_state_hash,
+                      new_state_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        sequence,
+                        _dumps(record),
+                        record["payload_hex"],
+                        record["prev_state_hash"],
+                        record["new_state_hash"],
+                    ),
+                )
+
+    def record_devnet_submission(
+        self,
+        sequence: int,
+        submission: dict,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> dict:
         with self.connect() as conn:
-            return self._record_devnet_submission(conn, sequence, submission)
+            return self._record_devnet_submission(conn, sequence, submission, sl_id, version)
 
     def load_verified_log(self) -> list:
         with self.connect() as conn:

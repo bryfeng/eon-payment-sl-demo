@@ -105,6 +105,23 @@ class VerifierStore:
                 conn.execute(f"DELETE FROM {table}")
             conn.execute("DELETE FROM sqlite_sequence WHERE name = 'verification_log'")
 
+    def reset_layer(self, sl_id: bytes, version: bytes) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM state_checkpoints
+                WHERE sl_id = ? AND version = ?
+                """,
+                (sl_id.hex(), version.hex()),
+            )
+            conn.execute(
+                """
+                DELETE FROM verification_log
+                WHERE sl_id = ? AND version = ?
+                """,
+                (sl_id.hex(), version.hex()),
+            )
+
     def _event_key(self, event: dict) -> str:
         network_id = str(event.get("network_id", "devnet"))
         height = int(event.get("height", 0))
@@ -202,13 +219,17 @@ class VerifierStore:
             "state_hash": row["state_hash"],
         }
 
-    def list_verification_log(self, sl_id: bytes | None = None) -> list[dict]:
+    def list_verification_log(
+        self,
+        sl_id: bytes | None = None,
+        version: bytes | None = None,
+    ) -> list[dict]:
         with self.connect() as conn:
             if sl_id is None:
                 rows = conn.execute(
                     "SELECT entry_json FROM verification_log ORDER BY id"
                 ).fetchall()
-            else:
+            elif version is None:
                 rows = conn.execute(
                     """
                     SELECT entry_json FROM verification_log
@@ -216,6 +237,15 @@ class VerifierStore:
                     ORDER BY sequence
                     """,
                     (sl_id.hex(),),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT entry_json FROM verification_log
+                    WHERE sl_id = ? AND version = ?
+                    ORDER BY sequence
+                    """,
+                    (sl_id.hex(), version.hex()),
                 ).fetchall()
         return [_loads(row["entry_json"]) for row in rows]
 

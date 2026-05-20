@@ -22,7 +22,9 @@ from typing import Optional
 
 from core import (
     PayloadDecodeError,
+    SL_ID,
     State,
+    VERSION,
     _read_json,
     parse_data_field_payload,
 )
@@ -39,6 +41,8 @@ def envelope_from_payload_bytes(
     payload: bytes,
     prev_state: State,
     eon_metadata: Optional[dict] = None,
+    expected_sl_id: bytes = SL_ID,
+    expected_version: bytes = VERSION,
 ) -> dict:
     """
     Convert decoded devnet payload bytes into the verifier envelope shape.
@@ -47,7 +51,7 @@ def envelope_from_payload_bytes(
     needs the previous state, which a verifier gets from its own accepted state
     log before processing the next ordered UTXO.
     """
-    decoded = parse_data_field_payload(payload)
+    decoded = parse_data_field_payload(payload, expected_sl_id, expected_version)
     prev_hash = prev_state.state_hash()
     if prev_hash != decoded["prev_state_hash"]:
         raise PayloadDecodeError(
@@ -68,21 +72,37 @@ def envelope_from_payload_hex(
     payload_hex: str,
     prev_state: State,
     eon_metadata: Optional[dict] = None,
+    expected_sl_id: bytes = SL_ID,
+    expected_version: bytes = VERSION,
 ) -> dict:
     try:
         payload = payload_hex_to_bytes(payload_hex)
     except ValueError as e:
         raise PayloadDecodeError(f"invalid payload hex: {e}") from e
-    return envelope_from_payload_bytes(payload, prev_state, eon_metadata)
+    return envelope_from_payload_bytes(
+        payload,
+        prev_state,
+        eon_metadata,
+        expected_sl_id,
+        expected_version,
+    )
 
 
 def envelope_from_scalars(
     scalars: list,
     prev_state: State,
     eon_metadata: Optional[dict] = None,
+    expected_sl_id: bytes = SL_ID,
+    expected_version: bytes = VERSION,
 ) -> dict:
     payload = scalar_hex_to_payload_bytes(scalars)
-    return envelope_from_payload_bytes(payload, prev_state, eon_metadata)
+    return envelope_from_payload_bytes(
+        payload,
+        prev_state,
+        eon_metadata,
+        expected_sl_id,
+        expected_version,
+    )
 
 
 def _load_state(path: str) -> State:

@@ -353,7 +353,11 @@ class BatchResult:
         return "\n".join(lines)
 
 
-def parse_data_field_payload(payload: bytes) -> dict:
+def parse_data_field_payload(
+    payload: bytes,
+    expected_sl_id: bytes = SL_ID,
+    expected_version: bytes = VERSION,
+) -> dict:
     """
     Decode canonical bytes recovered from EON UTXO Data scalars.
 
@@ -369,12 +373,12 @@ def parse_data_field_payload(payload: bytes) -> dict:
     offset = 0
     sl_id = payload[offset:offset + 4]
     offset += 4
-    if sl_id != SL_ID:
+    if sl_id != expected_sl_id:
         raise PayloadDecodeError(f"unexpected SL_ID: {sl_id.hex()}")
 
     version = payload[offset:offset + 2]
     offset += 2
-    if version != VERSION:
+    if version != expected_version:
         raise PayloadDecodeError(f"unexpected version: {version.hex()}")
 
     sequence = struct.unpack(">Q", payload[offset:offset + 8])[0]
@@ -418,7 +422,13 @@ def parse_data_field_payload(payload: bytes) -> dict:
     }
 
 
-def process_batch(state: State, actions: list, sequence: int = 1) -> tuple:
+def process_batch(
+    state: State,
+    actions: list,
+    sequence: int = 1,
+    sl_id: bytes = SL_ID,
+    version: bytes = VERSION,
+) -> tuple:
     """
     Process a batch of actions sequentially.
 
@@ -440,8 +450,8 @@ def process_batch(state: State, actions: list, sequence: int = 1) -> tuple:
             rejected.append((i, str(e)))
 
     result = BatchResult(
-        sl_id=SL_ID,
-        version=VERSION,
+        sl_id=sl_id,
+        version=version,
         sequence=sequence,
         prev_state_hash=prev_hash,
         new_state_hash=current.state_hash(),

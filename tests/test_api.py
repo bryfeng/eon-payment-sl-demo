@@ -166,6 +166,90 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(alice_balance["balance"], 60)
         self.assertEqual(bob_balance["balance"], 40)
 
+    def test_semantic_layer_runtime_state_is_scoped_by_layer(self):
+        alice = self._wallet("Alice", "alice_vk")
+        sl_a = SL_ID.hex()
+        sl_b = "00010002"
+        version = VERSION.hex()
+
+        response = self.client.post(
+            "/operator/init",
+            json={"issuer_vk": "issuer_a", "sl_id": sl_a, "version": version},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(
+            "/operator/init",
+            json={"issuer_vk": "issuer_b", "sl_id": sl_b, "version": version},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(
+            "/actions/mint",
+            json={
+                "to_address": alice["address"],
+                "amount": 100,
+                "sl_id": sl_a,
+                "version": version,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(
+            "/actions/mint",
+            json={
+                "to_address": alice["address"],
+                "amount": 500,
+                "sl_id": sl_b,
+                "version": version,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        pending_a = self.client.get(f"/pending?sl_id={sl_a}&version={version}")
+        pending_b = self.client.get(f"/pending?sl_id={sl_b}&version={version}")
+        self.assertEqual(pending_a.status_code, 200, pending_a.text)
+        self.assertEqual(pending_b.status_code, 200, pending_b.text)
+        self.assertEqual(len(pending_a.json()["pending"]), 1)
+        self.assertEqual(len(pending_b.json()["pending"]), 1)
+
+        response = self.client.post(f"/operator/batch?sl_id={sl_a}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["sl_id"], sl_a)
+        response = self.client.post(f"/operator/batch?sl_id={sl_b}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["sl_id"], sl_b)
+
+        balance_a = self.client.get(
+            f"/balances/{alice['address']}?source=operator&sl_id={sl_a}&version={version}"
+        )
+        balance_b = self.client.get(
+            f"/balances/{alice['address']}?source=operator&sl_id={sl_b}&version={version}"
+        )
+        self.assertEqual(balance_a.status_code, 200, balance_a.text)
+        self.assertEqual(balance_b.status_code, 200, balance_b.text)
+        self.assertEqual(balance_a.json()["balance"], 100)
+        self.assertEqual(balance_b.json()["balance"], 500)
+
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_a}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_b}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        verified_a = self.client.get(
+            f"/balances/{alice['address']}?source=verifier&sl_id={sl_a}&version={version}"
+        )
+        verified_b = self.client.get(
+            f"/balances/{alice['address']}?source=verifier&sl_id={sl_b}&version={version}"
+        )
+        self.assertEqual(verified_a.status_code, 200, verified_a.text)
+        self.assertEqual(verified_b.status_code, 200, verified_b.text)
+        self.assertEqual(verified_a.json()["balance"], 100)
+        self.assertEqual(verified_b.json()["balance"], 500)
+
+        batches_a = self.client.get(f"/operator/batches?sl_id={sl_a}&version={version}")
+        batches_b = self.client.get(f"/operator/batches?sl_id={sl_b}&version={version}")
+        self.assertEqual(len(batches_a.json()["batches"]), 1)
+        self.assertEqual(len(batches_b.json()["batches"]), 1)
+
     def test_transfer_rejects_vk_mismatch(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")

@@ -15,8 +15,10 @@ from verifier_engine.plugins import VerificationResult
 
 
 class PaymentSLPlugin:
-    sl_id = SL_ID
-    supported_versions = {VERSION}
+    def __init__(self, sl_id: bytes = SL_ID, version: bytes = VERSION):
+        self.sl_id = sl_id
+        self.version = version
+        self.supported_versions = {version}
 
     def genesis_state(self, config: dict) -> State:
         issuer_vk = config.get("issuer_vk")
@@ -34,11 +36,11 @@ class PaymentSLPlugin:
         return State.from_dict(data)
 
     def parse_payload(self, payload: bytes) -> dict:
-        decoded = parse_data_field_payload(payload)
+        decoded = parse_data_field_payload(payload, self.sl_id, self.version)
         return {
             **decoded,
             "sl_id": self.sl_id.hex(),
-            "version": VERSION.hex(),
+            "version": self.version.hex(),
         }
 
     def transition_from_envelope(self, envelope: dict) -> dict:
@@ -70,7 +72,7 @@ class PaymentSLPlugin:
             "actions_applied": envelope["actions_applied"],
             "payload_hex": envelope["payload_hex"].lower(),
             "sl_id": self.sl_id.hex(),
-            "version": VERSION.hex(),
+            "version": self.version.hex(),
         }
         if decoded != decoded_fields:
             raise PayloadDecodeError("payload_hex does not decode to the envelope fields")
@@ -80,8 +82,8 @@ class PaymentSLPlugin:
     def canonical_payload_hex(self, envelope: dict) -> str:
         actions = [Action.from_dict(d) for d in envelope["actions_applied"]]
         result = BatchResult(
-            sl_id=SL_ID,
-            version=VERSION,
+            sl_id=self.sl_id,
+            version=self.version,
             sequence=int(envelope["sequence"]),
             prev_state_hash=envelope["prev_state_hash"],
             new_state_hash=envelope["new_state_hash"],
@@ -105,7 +107,7 @@ class PaymentSLPlugin:
                     f"vs claimed {transition['prev_state_hash'][:16]}..."
                 ),
                 sl_id=self.sl_id,
-                version=VERSION,
+                version=self.version,
                 sequence=sequence,
                 prev_state_hash=transition["prev_state_hash"],
                 new_state_hash=transition["new_state_hash"],
@@ -124,7 +126,7 @@ class PaymentSLPlugin:
             valid=valid,
             message=msg,
             sl_id=self.sl_id,
-            version=VERSION,
+            version=self.version,
             sequence=sequence,
             prev_state_hash=transition["prev_state_hash"],
             new_state_hash=transition["new_state_hash"],
@@ -135,3 +137,7 @@ class PaymentSLPlugin:
 
 
 PAYMENT_PLUGIN = PaymentSLPlugin()
+
+
+def payment_plugin_for(sl_id: bytes, version: bytes) -> PaymentSLPlugin:
+    return PaymentSLPlugin(sl_id=sl_id, version=version)

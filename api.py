@@ -29,7 +29,7 @@ from devnet_submitter import (
     devnet_status as command_devnet_status,
     submit_batch_to_devnet,
 )
-from payment_plugin import PAYMENT_PLUGIN
+from payment_plugin import PAYMENT_PLUGIN, PaymentSLPlugin, payment_plugin_for
 from storage import DEFAULT_DB_PATH, SQLiteStorage
 from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore
 from verifier_engine.eon_data import ScalarFramingError, payload_bytes_to_scalar_hex
@@ -56,7 +56,16 @@ app.add_middleware(
 
 class InitRequest(BaseModel):
     issuer_vk: str = Field(default="circle_inc_verification_key", min_length=1)
+    sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
+    version: str = Field(default=core.VERSION.hex(), min_length=1)
+    operator_wallet_address: Optional[str] = None
+    base_layer_account_id: Optional[str] = None
     reset_existing: bool = False
+
+
+class LayerRequest(BaseModel):
+    sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
+    version: str = Field(default=core.VERSION.hex(), min_length=1)
 
 
 class WalletRequest(BaseModel):
@@ -107,21 +116,21 @@ class BaseLayerAccountGenerateRequest(BaseLayerAccountAllocateRequest):
     pass
 
 
-class AmountToRequest(BaseModel):
+class AmountToRequest(LayerRequest):
     to_address: str
     amount: int = Field(gt=0)
 
 
-class AmountFromRequest(BaseModel):
+class AmountFromRequest(LayerRequest):
     from_address: str
     amount: int = Field(gt=0)
 
 
-class TargetRequest(BaseModel):
+class TargetRequest(LayerRequest):
     target_address: str
 
 
-class TransferRequest(BaseModel):
+class TransferRequest(LayerRequest):
     from_address: str
     to_address: str
     amount: int = Field(gt=0)
@@ -134,6 +143,8 @@ class PayloadRequest(BaseModel):
 
 class DevnetSubmitRequest(BaseModel):
     force: bool = False
+    sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
+    version: str = Field(default=core.VERSION.hex(), min_length=1)
 
 
 class BaseEventRequest(BaseModel):
@@ -158,16 +169,25 @@ def configure_storage(root: Optional[Path] = None, db_path: Optional[Path] = Non
     STORE.configure(Path(db_path))
 
 
-def _require_initialized() -> None:
-    if not _initialized():
+def _require_initialized(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> None:
+    if not _initialized(sl_id, version):
         raise HTTPException(
             status_code=409,
             detail="SL is not initialized. Call POST /operator/init first.",
         )
 
 
-def _initialized() -> bool:
-    return STORE.is_initialized()
+def _initialized(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> bool:
+    if sl_id is None and version is None:
+        return bool(STORE.list_runtime_configs())
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    return STORE.is_initialized(layer_sl_id, layer_version)
 
 
 def _validate_address(address: str) -> str:
@@ -343,27 +363,24 @@ def _state_to_response(state: core.State) -> dict:
     }
 
 
-def _operator_state() -> core.State:
-    _require_initialized()
-    state = STORE.load_operator_state()
+def _operator_state(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> core.State:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    _require_initialized(layer_sl_id, layer_version)
+    state = STORE.load_operator_state(layer_sl_id, layer_version)
     if state is None:
         raise HTTPException(status_code=409, detail="operator state is missing")
     return state
 
 
-def _verified_state() -> core.State:
-    checkpoint = _verifier_store().load_checkpoint(
-        PAYMENT_PLUGIN.sl_id,
-        core.VERSION,
-    )
-    if checkpoint is not None:
-        return PAYMENT_PLUGIN.state_from_dict(checkpoint["state"])
-
-    legacy_state = STORE.load_verified_state()
-    if legacy_state is not None:
-        return legacy_state
-
-    raise HTTPException(status_code=404, detail="no verifier state found")
+def _verified_state(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> core.State:
+    state, _, _ = _verified_state_for_layer(sl_id, version)
+    return state
 
 
 def _verifier_store() -> VerifierStore:
@@ -372,11 +389,18 @@ def _verifier_store() -> VerifierStore:
 
 def _verifier_engine() -> VerifierEngine:
     config = {}
-    if _initialized():
-        config[PAYMENT_PLUGIN.sl_id.hex()] = {"issuer_vk": _issuer_vk()}
+    plugins_by_key: dict[tuple[str, str], PaymentSLPlugin] = {
+        (PAYMENT_PLUGIN.sl_id.hex(), core.VERSION.hex()): PAYMENT_PLUGIN
+    }
+    for runtime in STORE.list_runtime_configs():
+        sl_id_hex = str(runtime["sl_id"])
+        version_hex = str(runtime["version"])
+        plugin = _payment_plugin(sl_id_hex, version_hex)
+        plugins_by_key[(sl_id_hex, version_hex)] = plugin
+        config[sl_id_hex] = {"issuer_vk": runtime["issuer_vk"]}
     return VerifierEngine(
         store=_verifier_store(),
-        registry=PluginRegistry([PAYMENT_PLUGIN]),
+        registry=PluginRegistry(list(plugins_by_key.values())),
         plugin_config=config,
     )
 
@@ -407,28 +431,49 @@ def _version_hex(version: str) -> str:
     return raw.hex()
 
 
+def _layer_hex(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> tuple[str, str]:
+    sl_id_hex = _sl_id_bytes(sl_id).hex() if sl_id else core.SL_ID.hex()
+    version_value = _version_hex(version) if version else core.VERSION.hex()
+    return sl_id_hex, version_value
+
+
+def _layer_bytes(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> tuple[bytes, bytes]:
+    sl_id_hex, version_hex = _layer_hex(sl_id, version)
+    return bytes.fromhex(sl_id_hex), bytes.fromhex(version_hex)
+
+
+def _payment_plugin(sl_id: str, version: str) -> PaymentSLPlugin:
+    sl_id_bytes, version_bytes = _layer_bytes(sl_id, version)
+    if sl_id_bytes == PAYMENT_PLUGIN.sl_id and version_bytes == core.VERSION:
+        return PAYMENT_PLUGIN
+    return payment_plugin_for(sl_id_bytes, version_bytes)
+
+
 def _layer_coordinates(
     sl_id: Optional[str] = None,
     version: Optional[str] = None,
 ) -> tuple[bytes, bytes]:
-    sl_id_bytes = _sl_id_bytes(sl_id) if sl_id else core.SL_ID
-    version_bytes = bytes.fromhex(_version_hex(version)) if version else core.VERSION
-    return sl_id_bytes, version_bytes
+    return _layer_bytes(sl_id, version)
 
 
 def _verified_state_for_layer(
     sl_id: Optional[str] = None,
     version: Optional[str] = None,
 ) -> tuple[core.State, bytes, bytes]:
-    sl_id_bytes, version_bytes = _layer_coordinates(sl_id, version)
-    if sl_id_bytes != PAYMENT_PLUGIN.sl_id or version_bytes not in PAYMENT_PLUGIN.supported_versions:
-        raise HTTPException(status_code=404, detail="no verifier state found for semantic layer")
-
+    sl_id_hex, version_hex = _layer_hex(sl_id, version)
+    sl_id_bytes, version_bytes = _layer_bytes(sl_id_hex, version_hex)
+    plugin = _payment_plugin(sl_id_hex, version_hex)
     checkpoint = _verifier_store().load_checkpoint(sl_id_bytes, version_bytes)
     if checkpoint is not None:
-        return PAYMENT_PLUGIN.state_from_dict(checkpoint["state"]), sl_id_bytes, version_bytes
+        return plugin.state_from_dict(checkpoint["state"]), sl_id_bytes, version_bytes
 
-    legacy_state = STORE.load_verified_state()
+    legacy_state = STORE.load_verified_state(sl_id_hex, version_hex)
     if legacy_state is not None:
         return legacy_state, sl_id_bytes, version_bytes
 
@@ -439,15 +484,12 @@ def _operator_state_for_layer(
     sl_id: Optional[str] = None,
     version: Optional[str] = None,
 ) -> tuple[core.State, bytes, bytes]:
-    state = _operator_state()
-    sl_id_bytes, version_bytes = _layer_coordinates(sl_id, version)
-    config = STORE.load_sl_config()
-    active_sl_id = _sl_id_bytes(str(config.get("sl_id", core.SL_ID.hex())))
-    active_version = bytes.fromhex(_version_hex(str(config.get("version", core.VERSION.hex()))))
-
-    if sl_id_bytes != active_sl_id or version_bytes != active_version:
+    sl_id_hex, version_hex = _layer_hex(sl_id, version)
+    state = STORE.load_operator_state(sl_id_hex, version_hex)
+    if state is None:
         raise HTTPException(status_code=404, detail="no operator state found for semantic layer")
 
+    sl_id_bytes, version_bytes = _layer_bytes(sl_id_hex, version_hex)
     return state, sl_id_bytes, version_bytes
 
 
@@ -457,44 +499,93 @@ def _model_to_dict(model: BaseModel) -> dict:
     return model.dict(exclude_none=True)
 
 
-def _queue_action(action: dict) -> dict:
-    STORE.append_pending(action)
+def _queue_action(
+    action: dict,
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    STORE.append_pending(action, layer_sl_id, layer_version)
     return {
         "queued": True,
         "action": action,
-        "pending_count": STORE.pending_count(),
+        "pending_count": STORE.pending_count(layer_sl_id, layer_version),
+        "sl_id": layer_sl_id,
+        "version": layer_version,
     }
 
 
-def _issuer_vk() -> str:
-    _require_initialized()
-    return STORE.load_sl_config()["issuer_vk"]
+def _issuer_vk(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> str:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    _require_initialized(layer_sl_id, layer_version)
+    config = STORE.load_sl_config(layer_sl_id, layer_version)
+    if not config:
+        raise HTTPException(status_code=409, detail="SL config is missing")
+    return config["issuer_vk"]
 
 
-def _next_nonce() -> int:
-    _require_initialized()
-    return STORE.next_nonce()
+def _next_nonce(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> int:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    _require_initialized(layer_sl_id, layer_version)
+    return STORE.next_nonce(layer_sl_id, layer_version)
 
 
-def _latest_batch() -> dict:
-    batch = STORE.latest_batch()
+def _latest_batch(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    batch = STORE.latest_batch(layer_sl_id, layer_version)
     if batch is None:
         raise HTTPException(status_code=404, detail="no operator batch found")
     return batch
 
 
-def _active_semantic_layer_record() -> Optional[dict]:
-    sl_id = core.SL_ID.hex()
-    config = STORE.load_sl_config()
+def _active_runtime_config(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> Optional[dict]:
+    if sl_id is not None or version is not None:
+        layer_sl_id, layer_version = _layer_hex(sl_id, version)
+        return STORE.load_sl_config(layer_sl_id, layer_version)
+
+    runtimes = STORE.list_runtime_configs()
+    return runtimes[0] if runtimes else STORE.load_sl_config()
+
+
+def _active_semantic_layer_record(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> Optional[dict]:
+    config = _active_runtime_config(sl_id, version)
     if config and config.get("sl_id"):
-        sl_id = str(config["sl_id"])
-    return STORE.get_semantic_layer(sl_id)
+        record = STORE.get_semantic_layer(str(config["sl_id"]))
+        if record and record.get("version") == config.get("version"):
+            return record
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    record = STORE.get_semantic_layer(layer_sl_id)
+    if record and record.get("version") == layer_version:
+        return record
+    return None
 
 
-def _devnet_runtime_status() -> dict:
+def _devnet_runtime_status(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> dict:
     status = command_devnet_status()
-    active_record = _active_semantic_layer_record()
-    active_account_id = active_record.get("base_layer_account_id") if active_record else None
+    active_record = _active_semantic_layer_record(sl_id, version)
+    active_config = _active_runtime_config(sl_id, version)
+    active_account_id = (
+        (active_record or {}).get("base_layer_account_id")
+        or (active_config or {}).get("base_layer_account_id")
+    )
     vault_ready = vault_configured()
     pool_counts = STORE.base_layer_account_pool_counts()
     account_generator_ready = bool(vault_ready and pool_counts["available"] > 0)
@@ -507,7 +598,9 @@ def _devnet_runtime_status() -> dict:
             "account_generator": "configured" if account_generator_ready else None,
             "account_generator_configured": account_generator_ready,
             "base_layer_account_count": STORE.base_layer_account_count(),
-            "active_semantic_layer_id": active_record.get("sl_id") if active_record else None,
+            "active_semantic_layer_id": (
+                (active_record or active_config or {}).get("sl_id")
+            ),
             "active_base_layer_account_id": active_account_id,
             "account_configured": account_ready,
             "ready": submitter_ready and account_ready,
@@ -517,12 +610,19 @@ def _devnet_runtime_status() -> dict:
     return status
 
 
-def _submission_account_json() -> Optional[dict[str, Any]]:
-    active_record = _active_semantic_layer_record()
-    if not active_record:
+def _submission_account_json(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    active_record = _active_semantic_layer_record(sl_id, version)
+    active_config = _active_runtime_config(sl_id, version)
+    if not active_record and not active_config:
         return None
 
-    account_id = active_record.get("base_layer_account_id")
+    account_id = (
+        (active_record or {}).get("base_layer_account_id")
+        or (active_config or {}).get("base_layer_account_id")
+    )
     if not account_id:
         return None
 
@@ -539,8 +639,16 @@ def _submission_account_json() -> Optional[dict[str, Any]]:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
 
-def _accept_envelope(envelope: dict) -> tuple[bool, str]:
-    result = _verifier_engine().accept_envelope(PAYMENT_PLUGIN, envelope)
+def _accept_envelope(
+    envelope: dict,
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> tuple[bool, str]:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    result = _verifier_engine().accept_envelope(
+        _payment_plugin(layer_sl_id, layer_version),
+        envelope,
+    )
     if result["accepted"]:
         return True, "accepted"
     return False, result["message"]
@@ -562,19 +670,24 @@ def root() -> dict:
 
 @app.get("/config")
 def config() -> dict:
+    active_config = _active_runtime_config()
+    active_sl_id = str(active_config["sl_id"]) if active_config else core.SL_ID.hex()
+    active_version = str(active_config["version"]) if active_config else core.VERSION.hex()
     response = {
-        "initialized": _initialized(),
-        "sl_id": core.SL_ID.hex(),
-        "version": core.VERSION.hex(),
+        "initialized": bool(active_config),
+        "sl_id": active_sl_id,
+        "version": active_version,
+        "runtimes": STORE.list_runtime_configs(),
         "storage": {
             "type": "sqlite",
             "db_path": str(STORE.db_path),
         },
     }
-    if _initialized():
-        response["issuer_vk"] = STORE.load_sl_config()["issuer_vk"]
-        response["operator_state_hash"] = _operator_state().state_hash()
-        response["next_batch_sequence"] = STORE.next_batch_sequence()
+    if active_config:
+        operator_state = STORE.load_operator_state(active_sl_id, active_version)
+        response["issuer_vk"] = active_config["issuer_vk"]
+        response["operator_state_hash"] = operator_state.state_hash() if operator_state else None
+        response["next_batch_sequence"] = STORE.next_batch_sequence(active_sl_id, active_version)
     return response
 
 
@@ -595,21 +708,66 @@ def reset() -> dict:
 @app.post("/operator/init")
 def operator_init(request: InitRequest) -> dict:
     with STATE_LOCK:
-        if _initialized():
+        sl_id = _sl_id_bytes(request.sl_id).hex()
+        version = _version_hex(request.version)
+        operator_wallet_address = (
+            _validate_address(request.operator_wallet_address)
+            if request.operator_wallet_address
+            else None
+        )
+        base_layer_account_id = (
+            request.base_layer_account_id.strip()
+            if request.base_layer_account_id
+            else None
+        )
+        record = STORE.get_semantic_layer(sl_id)
+        if record and record.get("version") == version:
+            operator_wallet_address = operator_wallet_address or record.get("operator_wallet_address")
+            base_layer_account_id = base_layer_account_id or record.get("base_layer_account_id")
+
+        if operator_wallet_address:
+            operator_wallet = STORE.get_wallet(operator_wallet_address)
+            if not operator_wallet:
+                raise HTTPException(status_code=400, detail="operator wallet is not registered")
+            if operator_wallet.get("kind") != "sl_operator":
+                raise HTTPException(status_code=400, detail="operator wallet must use kind=sl_operator")
+
+        if base_layer_account_id:
+            base_layer_account = STORE.get_base_layer_account(base_layer_account_id)
+            if not base_layer_account:
+                raise HTTPException(status_code=400, detail="base-layer account is not registered")
+            if (
+                operator_wallet_address
+                and base_layer_account["owner_wallet_address"] != operator_wallet_address
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="base-layer account must belong to operator wallet",
+                )
+
+        if _initialized(sl_id, version):
             if not request.reset_existing:
                 raise HTTPException(
                     status_code=409,
-                    detail="SL is already initialized. Use reset_existing=true or POST /reset.",
+                    detail="SL runtime is already initialized. Use reset_existing=true or POST /reset.",
                 )
-            reset()
+            _verifier_store().reset_layer(bytes.fromhex(sl_id), bytes.fromhex(version))
 
         config_obj = {
             "issuer_vk": request.issuer_vk,
-            "sl_id": core.SL_ID.hex(),
-            "version": core.VERSION.hex(),
+            "sl_id": sl_id,
+            "version": version,
+            "operator_wallet_address": operator_wallet_address,
+            "base_layer_account_id": base_layer_account_id,
         }
-        genesis = STORE.initialize(request.issuer_vk)
-        _verifier_store().reset()
+        genesis = STORE.initialize(
+            request.issuer_vk,
+            sl_id=sl_id,
+            version=version,
+            operator_wallet_address=operator_wallet_address,
+            base_layer_account_id=base_layer_account_id,
+            reset_existing=request.reset_existing,
+        )
 
         return {
             "initialized": True,
@@ -619,12 +777,18 @@ def operator_init(request: InitRequest) -> dict:
 
 
 @app.get("/operator/state")
-def operator_state() -> dict:
-    state = _operator_state()
+def operator_state(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    state = _operator_state(layer_sl_id, layer_version)
     return {
         "state": _state_to_response(state),
-        "pending_count": STORE.pending_count(),
-        "next_batch_sequence": STORE.next_batch_sequence(),
+        "pending_count": STORE.pending_count(layer_sl_id, layer_version),
+        "next_batch_sequence": STORE.next_batch_sequence(layer_sl_id, layer_version),
+        "sl_id": layer_sl_id,
+        "version": layer_version,
     }
 
 
@@ -833,60 +997,65 @@ def get_balance(
 @app.post("/actions/mint")
 def mint(request: AmountToRequest) -> dict:
     with STATE_LOCK:
+        sl_id, version = _layer_hex(request.sl_id, request.version)
         to_address = _validate_address(request.to_address)
         action = {
             "type": core.ActionType.MINT.value,
-            "sender_vk": _issuer_vk(),
-            "nonce": _next_nonce(),
+            "sender_vk": _issuer_vk(sl_id, version),
+            "nonce": _next_nonce(sl_id, version),
             "to": to_address,
             "amount": request.amount,
         }
-        return _queue_action(action)
+        return _queue_action(action, sl_id, version)
 
 
 @app.post("/actions/burn")
 def burn(request: AmountFromRequest) -> dict:
     with STATE_LOCK:
+        sl_id, version = _layer_hex(request.sl_id, request.version)
         from_address = _validate_address(request.from_address)
         action = {
             "type": core.ActionType.BURN.value,
-            "sender_vk": _issuer_vk(),
-            "nonce": _next_nonce(),
+            "sender_vk": _issuer_vk(sl_id, version),
+            "nonce": _next_nonce(sl_id, version),
             "from_addr": from_address,
             "amount": request.amount,
         }
-        return _queue_action(action)
+        return _queue_action(action, sl_id, version)
 
 
 @app.post("/actions/freeze")
 def freeze(request: TargetRequest) -> dict:
     with STATE_LOCK:
+        sl_id, version = _layer_hex(request.sl_id, request.version)
         target_address = _validate_address(request.target_address)
         action = {
             "type": core.ActionType.FREEZE.value,
-            "sender_vk": _issuer_vk(),
-            "nonce": _next_nonce(),
+            "sender_vk": _issuer_vk(sl_id, version),
+            "nonce": _next_nonce(sl_id, version),
             "target": target_address,
         }
-        return _queue_action(action)
+        return _queue_action(action, sl_id, version)
 
 
 @app.post("/actions/unfreeze")
 def unfreeze(request: TargetRequest) -> dict:
     with STATE_LOCK:
+        sl_id, version = _layer_hex(request.sl_id, request.version)
         target_address = _validate_address(request.target_address)
         action = {
             "type": core.ActionType.UNFREEZE.value,
-            "sender_vk": _issuer_vk(),
-            "nonce": _next_nonce(),
+            "sender_vk": _issuer_vk(sl_id, version),
+            "nonce": _next_nonce(sl_id, version),
             "target": target_address,
         }
-        return _queue_action(action)
+        return _queue_action(action, sl_id, version)
 
 
 @app.post("/actions/transfer")
 def transfer(request: TransferRequest) -> dict:
     with STATE_LOCK:
+        sl_id, version = _layer_hex(request.sl_id, request.version)
         from_address = _validate_address(request.from_address)
         to_address = _validate_address(request.to_address)
         if core.hash_vk(request.vk) != from_address:
@@ -895,31 +1064,54 @@ def transfer(request: TransferRequest) -> dict:
         action = {
             "type": core.ActionType.TRANSFER.value,
             "sender_vk": request.vk,
-            "nonce": _next_nonce(),
+            "nonce": _next_nonce(sl_id, version),
             "from_addr": from_address,
             "to": to_address,
             "amount": request.amount,
         }
-        return _queue_action(action)
+        return _queue_action(action, sl_id, version)
 
 
 @app.get("/pending")
-def pending() -> dict:
-    _require_initialized()
-    return {"pending": STORE.load_pending()}
+def pending(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    _require_initialized(layer_sl_id, layer_version)
+    return {
+        "pending": STORE.load_pending(layer_sl_id, layer_version),
+        "sl_id": layer_sl_id,
+        "version": layer_version,
+    }
 
 
 @app.post("/operator/batch")
-def operator_batch() -> dict:
+def operator_batch(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
     with STATE_LOCK:
-        state = _operator_state()
-        pending_actions = STORE.load_pending()
+        layer_sl_id, layer_version = _layer_hex(sl_id, version)
+        state = _operator_state(layer_sl_id, layer_version)
+        pending_actions = STORE.load_pending(layer_sl_id, layer_version)
         if not pending_actions:
-            return {"batched": False, "message": "No pending actions. Nothing to batch."}
+            return {
+                "batched": False,
+                "message": "No pending actions. Nothing to batch.",
+                "sl_id": layer_sl_id,
+                "version": layer_version,
+            }
 
-        sequence = STORE.next_batch_sequence()
+        sequence = STORE.next_batch_sequence(layer_sl_id, layer_version)
         actions = [core.Action.from_dict(d) for d in pending_actions]
-        new_state, result = core.process_batch(state, actions, sequence=sequence)
+        new_state, result = core.process_batch(
+            state,
+            actions,
+            sequence=sequence,
+            sl_id=bytes.fromhex(layer_sl_id),
+            version=bytes.fromhex(layer_version),
+        )
         payload = result.data_field_payload()
         payload_hex = payload.hex()
         data_scalars = payload_bytes_to_scalar_hex(payload)
@@ -956,32 +1148,50 @@ def operator_batch() -> dict:
             "payload_size": len(payload),
             "data_scalars": data_scalars,
             "data_len": len(data_scalars),
+            "sl_id": layer_sl_id,
+            "version": layer_version,
         }
 
-        STORE.commit_operator_batch(new_state, record, sequence)
+        STORE.commit_operator_batch(new_state, record, sequence, layer_sl_id, layer_version)
 
         return {
             "batched": True,
             "batch": record,
             "operator_state": _state_to_response(new_state),
+            "sl_id": layer_sl_id,
+            "version": layer_version,
         }
 
 
 @app.get("/operator/batches")
-def operator_batches() -> dict:
-    _require_initialized()
-    return {"batches": STORE.list_batches()}
+def operator_batches(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    _require_initialized(layer_sl_id, layer_version)
+    return {
+        "batches": STORE.list_batches(layer_sl_id, layer_version),
+        "sl_id": layer_sl_id,
+        "version": layer_version,
+    }
 
 
 @app.get("/operator/latest-payload")
-def latest_payload() -> dict:
-    batch = _latest_batch()
+def latest_payload(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    batch = _latest_batch(layer_sl_id, layer_version)
     return {
         "sequence": batch["sequence"],
         "payload_hex": batch["payload_hex"],
         "payload_size": batch["payload_size"],
         "data_scalars": batch["data_scalars"],
         "data_len": batch["data_len"],
+        "sl_id": layer_sl_id,
+        "version": layer_version,
     }
 
 
@@ -1005,14 +1215,18 @@ def encode_payload(request: PayloadRequest) -> dict:
 
 
 @app.get("/devnet/status")
-def get_devnet_status() -> dict:
-    return _devnet_runtime_status()
+def get_devnet_status(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
+    return _devnet_runtime_status(sl_id, version)
 
 
 @app.post("/devnet/submit-latest-batch")
 def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
     with STATE_LOCK:
-        batch = _latest_batch()
+        sl_id, version = _layer_hex(request.sl_id, request.version)
+        batch = _latest_batch(sl_id, version)
         existing = batch.get("devnet_submission")
         if existing and existing.get("status") == "submitted" and not request.force:
             raise HTTPException(
@@ -1021,7 +1235,7 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
             )
 
         try:
-            status = _devnet_runtime_status()
+            status = _devnet_runtime_status(sl_id, version)
             if not status["ready"]:
                 if not status.get("submitter_configured"):
                     raise DevnetSubmitError(
@@ -1042,8 +1256,13 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
                     "or configure legacy EON_OPERATOR_WALLET_FILE"
                 )
 
-            submission = submit_batch_to_devnet(batch, _submission_account_json())
-            updated_batch = STORE.record_devnet_submission(batch["sequence"], submission)
+            submission = submit_batch_to_devnet(batch, _submission_account_json(sl_id, version))
+            updated_batch = STORE.record_devnet_submission(
+                batch["sequence"],
+                submission,
+                sl_id,
+                version,
+            )
         except DevnetSubmitError as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
         except KeyError as e:
@@ -1054,29 +1273,37 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
         "sequence": submission["sequence"],
         "devnet_submission": submission,
         "batch": updated_batch,
+        "sl_id": sl_id,
+        "version": version,
     }
 
 
 @app.get("/verifier/state")
-def verifier_state(sl_id: str = Query(default=core.SL_ID.hex())) -> dict:
-    sl_id_bytes = _sl_id_bytes(sl_id)
-    if sl_id_bytes != PAYMENT_PLUGIN.sl_id:
-        raise HTTPException(status_code=404, detail="no plugin registered for sl_id")
-    state = _verified_state()
-    log = _verifier_store().list_verification_log(sl_id_bytes)
+def verifier_state(
+    sl_id: str = Query(default=core.SL_ID.hex()),
+    version: str = Query(default=core.VERSION.hex()),
+) -> dict:
+    state, sl_id_bytes, version_bytes = _verified_state_for_layer(sl_id, version)
+    log = _verifier_store().list_verification_log(sl_id_bytes, version_bytes)
     return {
         "sl_id": sl_id_bytes.hex(),
+        "version": version_bytes.hex(),
         "state": _state_to_response(state),
         "accepted_payloads": len([entry for entry in log if entry.get("verdict") == "accepted"]),
     }
 
 
 @app.get("/verifier/log")
-def verifier_log(sl_id: str = Query(default=core.SL_ID.hex())) -> dict:
+def verifier_log(
+    sl_id: str = Query(default=core.SL_ID.hex()),
+    version: Optional[str] = Query(default=None),
+) -> dict:
     sl_id_bytes = _sl_id_bytes(sl_id)
+    version_bytes = bytes.fromhex(_version_hex(version)) if version else None
     return {
         "sl_id": sl_id_bytes.hex(),
-        "log": _verifier_store().list_verification_log(sl_id_bytes),
+        "version": version_bytes.hex() if version_bytes else None,
+        "log": _verifier_store().list_verification_log(sl_id_bytes, version_bytes),
     }
 
 
@@ -1100,9 +1327,13 @@ def verifier_ingest_event(event: BaseEventRequest) -> dict:
 
 
 @app.post("/verifier/accept-latest-batch")
-def verifier_accept_latest_batch() -> dict:
+def verifier_accept_latest_batch(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
     with STATE_LOCK:
-        batch = _latest_batch()
+        layer_sl_id, layer_version = _layer_hex(sl_id, version)
+        batch = _latest_batch(layer_sl_id, layer_version)
         envelope = {
             "prev_state": batch["prev_state"],
             "sequence": batch["sequence"],
@@ -1111,7 +1342,7 @@ def verifier_accept_latest_batch() -> dict:
             "actions_applied": batch["actions_applied"],
             "payload_hex": batch["payload_hex"],
         }
-        valid, msg = _accept_envelope(envelope)
+        valid, msg = _accept_envelope(envelope, layer_sl_id, layer_version)
         if not valid:
             raise HTTPException(status_code=400, detail=msg)
 
@@ -1119,14 +1350,21 @@ def verifier_accept_latest_batch() -> dict:
             "accepted": True,
             "message": msg,
             "sequence": envelope["sequence"],
-            "verifier_state": _state_to_response(_verified_state()),
+            "verifier_state": _state_to_response(_verified_state(layer_sl_id, layer_version)),
+            "sl_id": layer_sl_id,
+            "version": layer_version,
         }
 
 
 @app.post("/verifier/accept-envelope")
-def verifier_accept_envelope(envelope: Dict[str, Any]) -> dict:
+def verifier_accept_envelope(
+    envelope: Dict[str, Any],
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
     with STATE_LOCK:
-        valid, msg = _accept_envelope(envelope)
+        layer_sl_id, layer_version = _layer_hex(sl_id, version)
+        valid, msg = _accept_envelope(envelope, layer_sl_id, layer_version)
         if not valid:
             raise HTTPException(status_code=400, detail=msg)
 
@@ -1134,15 +1372,27 @@ def verifier_accept_envelope(envelope: Dict[str, Any]) -> dict:
             "accepted": True,
             "message": msg,
             "sequence": envelope["sequence"],
-            "verifier_state": _state_to_response(_verified_state()),
+            "verifier_state": _state_to_response(_verified_state(layer_sl_id, layer_version)),
+            "sl_id": layer_sl_id,
+            "version": layer_version,
         }
 
 
 @app.post("/verifier/envelope-from-payload")
-def verifier_envelope_from_payload(request: PayloadRequest) -> dict:
-    state = _verified_state()
+def verifier_envelope_from_payload(
+    request: PayloadRequest,
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    state = _verified_state(layer_sl_id, layer_version)
     try:
-        return envelope_from_payload_hex(request.payload_hex, state)
+        return envelope_from_payload_hex(
+            request.payload_hex,
+            state,
+            expected_sl_id=bytes.fromhex(layer_sl_id),
+            expected_version=bytes.fromhex(layer_version),
+        )
     except core.PayloadDecodeError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
 
