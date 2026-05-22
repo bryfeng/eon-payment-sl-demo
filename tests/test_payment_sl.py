@@ -81,6 +81,42 @@ class PaymentSLTests(unittest.TestCase):
         self.assertEqual(decoded["new_state_hash"], envelope["new_state_hash"])
         self.assertEqual(decoded["actions_applied"], envelope["actions_applied"])
 
+    def test_register_asset_mint_transfer_round_trip(self):
+        issuer = "issuer_vk"
+        alice = hash_vk("alice_vk")
+        bob = hash_vk("bob_vk")
+        state = State(issuer_vk=issuer)
+        actions = [
+            Action(
+                ActionType.REGISTER_ASSET,
+                issuer,
+                1,
+                asset_id="BSTK",
+                symbol="BSTK",
+                asset_name="bStocks",
+                asset_type="equity",
+            ),
+            Action(ActionType.MINT, issuer, 2, asset_id="BSTK", to=alice, amount=100),
+            Action(
+                ActionType.TRANSFER,
+                "alice_vk",
+                3,
+                asset_id="BSTK",
+                from_addr=alice,
+                to=bob,
+                amount=40,
+            ),
+        ]
+
+        next_state, result = process_batch(state, actions)
+        decoded = parse_data_field_payload(result.data_field_payload())
+
+        self.assertEqual(decoded["actions_applied"], [action.to_dict() for action in actions])
+        self.assertEqual(next_state.get_balance(alice, "BSTK"), 60)
+        self.assertEqual(next_state.get_balance(bob, "BSTK"), 40)
+        self.assertEqual(next_state.get_total_supply("BSTK"), 100)
+        self.assertEqual(next_state.total_supply, 0)
+
     def test_devnet_scalar_framing_round_trip(self):
         envelope = self._valid_envelope()
         payload = bytes.fromhex(envelope["payload_hex"])

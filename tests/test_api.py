@@ -523,6 +523,86 @@ class ApiTests(unittest.TestCase):
             response.json()["semantic_layers"][0]["base_layer_account_id"],
             base_account["id"],
         )
+        self.assertEqual(response.json()["semantic_layers"][0]["assets"], [])
+
+    def test_semantic_layer_assets_can_be_registered_and_minted(self):
+        operator = self._operator_wallet()
+        sl_id = "00010002"
+        version = VERSION.hex()
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "bStocks",
+                "sl_id": sl_id,
+                "version": version,
+                "operator_wallet_address": operator["address"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(
+            "/operator/init",
+            json={
+                "issuer_vk": "issuer_vk",
+                "sl_id": sl_id,
+                "version": version,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(
+            f"/semantic-layers/{sl_id}/assets?version={version}",
+            json={
+                "asset_id": "bstk",
+                "symbol": "BSTK",
+                "name": "bStocks",
+                "decimals": 0,
+                "asset_type": "equity",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["asset"]["asset_id"], "BSTK")
+        self.assertEqual(response.json()["queued_registration"]["type"], "register_asset")
+
+        alice = self._wallet("Alice", "alice_vk")
+        response = self.client.post(
+            "/actions/mint",
+            json={
+                "to_address": alice["address"],
+                "amount": 100,
+                "asset_id": "BSTK",
+                "sl_id": sl_id,
+                "version": version,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        pending = self.client.get(f"/pending?sl_id={sl_id}&version={version}")
+        self.assertEqual(pending.status_code, 200, pending.text)
+        self.assertEqual([item["type"] for item in pending.json()["pending"]], ["register_asset", "mint"])
+        self.assertEqual([item["nonce"] for item in pending.json()["pending"]], [1, 2])
+
+        response = self.client.post(f"/operator/batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["applied"], 2)
+        state = response.json()["operator_state"]
+        self.assertEqual(state["total_supply_by_asset"]["BSTK"], 100)
+
+        response = self.client.get(
+            f"/balances/{alice['address']}?source=operator&sl_id={sl_id}&version={version}&asset_id=BSTK"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["asset_id"], "BSTK")
+        self.assertEqual(response.json()["balance"], 100)
+
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get(
+            f"/balances/{alice['address']}?source=verifier&sl_id={sl_id}&version={version}&asset_id=BSTK"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["balance"], 100)
 
     def test_semantic_layer_record_hydrates_existing_runtime_metadata(self):
         self._init()

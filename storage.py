@@ -132,6 +132,7 @@ class SQLiteStorage:
               base_layer_account_id TEXT,
               issuer_vk_ref TEXT,
               operator_vk_ref TEXT,
+              assets_json TEXT NOT NULL DEFAULT '[]',
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
               FOREIGN KEY(operator_wallet_address) REFERENCES wallets(address),
@@ -223,6 +224,10 @@ class SQLiteStorage:
         }
         if "base_layer_account_id" not in semantic_layer_columns:
             conn.execute("ALTER TABLE semantic_layers ADD COLUMN base_layer_account_id TEXT")
+        if "assets_json" not in semantic_layer_columns:
+            conn.execute(
+                "ALTER TABLE semantic_layers ADD COLUMN assets_json TEXT NOT NULL DEFAULT '[]'"
+            )
         base_layer_account_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(base_layer_accounts)").fetchall()
@@ -603,9 +608,12 @@ class SQLiteStorage:
         version: str = core.VERSION.hex(),
         operator_wallet_address: Optional[str] = None,
         base_layer_account_id: Optional[str] = None,
+        assets: Optional[list[dict]] = None,
         reset_existing: bool = False,
     ) -> core.State:
         genesis = core.State(issuer_vk=issuer_vk)
+        for asset in assets or []:
+            genesis.register_asset(asset)
         config = {
             "issuer_vk": issuer_vk,
             "sl_id": sl_id,
@@ -1110,6 +1118,11 @@ class SQLiteStorage:
 
     def upsert_semantic_layer(self, record: dict) -> None:
         with self.connect() as conn:
+            existing = self._get_semantic_layer(conn, record["sl_id"])
+            assets = record.get("assets")
+            if assets is None and existing is not None:
+                assets = existing.get("assets", [])
+            assets = assets or []
             conn.execute(
                 """
                 INSERT INTO semantic_layers (
@@ -1120,9 +1133,10 @@ class SQLiteStorage:
                   base_layer_account_id,
                   issuer_vk_ref,
                   operator_vk_ref,
+                  assets_json,
                   updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(sl_id) DO UPDATE SET
                   name = excluded.name,
                   version = excluded.version,
@@ -1130,6 +1144,7 @@ class SQLiteStorage:
                   base_layer_account_id = excluded.base_layer_account_id,
                   issuer_vk_ref = excluded.issuer_vk_ref,
                   operator_vk_ref = excluded.operator_vk_ref,
+                  assets_json = excluded.assets_json,
                   updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -1140,6 +1155,7 @@ class SQLiteStorage:
                     record.get("base_layer_account_id"),
                     record.get("issuer_vk_ref"),
                     record.get("operator_vk_ref"),
+                    _dumps(assets),
                 ),
             )
             config = self._get_runtime_config(conn, record["sl_id"], record["version"])
@@ -1154,25 +1170,25 @@ class SQLiteStorage:
                     next_sequence=int(config["next_sequence"]),
                 )
 
-    def get_semantic_layer(self, sl_id: str) -> Optional[dict]:
-        with self.connect() as conn:
-            row = conn.execute(
-                """
-                SELECT
-                  sl_id,
-                  name,
-                  version,
-                  operator_wallet_address,
-                  base_layer_account_id,
-                  issuer_vk_ref,
-                  operator_vk_ref,
-                  created_at,
-                  updated_at
-                FROM semantic_layers
-                WHERE sl_id = ?
-                """,
-                (sl_id,),
-            ).fetchone()
+    def _get_semantic_layer(self, conn: sqlite3.Connection, sl_id: str) -> Optional[dict]:
+        row = conn.execute(
+            """
+            SELECT
+              sl_id,
+              name,
+              version,
+              operator_wallet_address,
+              base_layer_account_id,
+              issuer_vk_ref,
+              operator_vk_ref,
+              assets_json,
+              created_at,
+              updated_at
+            FROM semantic_layers
+            WHERE sl_id = ?
+            """,
+            (sl_id,),
+        ).fetchone()
         if row is None:
             return None
         return {
@@ -1183,9 +1199,40 @@ class SQLiteStorage:
             "base_layer_account_id": row["base_layer_account_id"],
             "issuer_vk_ref": row["issuer_vk_ref"],
             "operator_vk_ref": row["operator_vk_ref"],
+            "assets": _loads(row["assets_json"] or "[]"),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    def get_semantic_layer(self, sl_id: str) -> Optional[dict]:
+        with self.connect() as conn:
+            return self._get_semantic_layer(conn, sl_id)
+
+    def append_semantic_layer_asset(
+        self,
+        sl_id: str,
+        version: str,
+        asset: dict,
+    ) -> dict:
+        with self.connect() as conn:
+            record = self._get_semantic_layer(conn, sl_id)
+            if record is None or record["version"] != version:
+                raise KeyError("semantic layer not found")
+
+            assets = list(record.get("assets", []))
+            if any(existing["asset_id"] == asset["asset_id"] for existing in assets):
+                raise ValueError(f"asset already registered: {asset['asset_id']}")
+            assets.append(asset)
+            conn.execute(
+                """
+                UPDATE semantic_layers
+                SET assets_json = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE sl_id = ? AND version = ?
+                """,
+                (_dumps(assets), sl_id, version),
+            )
+            record["assets"] = assets
+            return record
 
     def list_semantic_layers(self) -> list:
         with self.connect() as conn:
@@ -1199,6 +1246,7 @@ class SQLiteStorage:
                   base_layer_account_id,
                   issuer_vk_ref,
                   operator_vk_ref,
+                  assets_json,
                   created_at,
                   updated_at
                 FROM semantic_layers
@@ -1214,6 +1262,7 @@ class SQLiteStorage:
                 "base_layer_account_id": row["base_layer_account_id"],
                 "issuer_vk_ref": row["issuer_vk_ref"],
                 "operator_vk_ref": row["operator_vk_ref"],
+                "assets": _loads(row["assets_json"] or "[]"),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }

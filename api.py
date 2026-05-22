@@ -66,6 +66,7 @@ class InitRequest(BaseModel):
 class LayerRequest(BaseModel):
     sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
     version: str = Field(default=core.VERSION.hex(), min_length=1)
+    asset_id: Optional[str] = None
 
 
 class WalletRequest(BaseModel):
@@ -73,6 +74,15 @@ class WalletRequest(BaseModel):
     vk: Optional[str] = None
     address: Optional[str] = None
     kind: Literal["user", "sl_operator", "coordinator", "verifier"] = "user"
+
+
+class SemanticLayerAssetRequest(BaseModel):
+    asset_id: str = Field(min_length=1, max_length=64)
+    symbol: str = Field(min_length=1, max_length=24)
+    name: str = Field(min_length=1)
+    decimals: int = Field(default=0, ge=0, le=18)
+    asset_type: str = Field(default="fungible", min_length=1, max_length=32)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class SemanticLayerRequest(BaseModel):
@@ -83,6 +93,7 @@ class SemanticLayerRequest(BaseModel):
     base_layer_account_id: Optional[str] = None
     issuer_vk_ref: Optional[str] = None
     operator_vk_ref: Optional[str] = None
+    assets: list[SemanticLayerAssetRequest] = Field(default_factory=list)
 
 
 class BaseLayerAccountRequest(BaseModel):
@@ -211,6 +222,90 @@ def _validate_eon_address(address: str) -> str:
     except ValueError as e:
         raise HTTPException(status_code=400, detail="eon_address must be hex") from e
     return f"0x{raw}"
+
+
+def _validate_asset_id(value: str) -> str:
+    asset_id = value.strip().upper()
+    if not asset_id:
+        raise HTTPException(status_code=400, detail="asset_id is required")
+    if len(asset_id) > 64:
+        raise HTTPException(status_code=400, detail="asset_id must be 64 chars or fewer")
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:-")
+    if any(char not in allowed for char in asset_id):
+        raise HTTPException(
+            status_code=400,
+            detail="asset_id may contain letters, numbers, underscore, dash, dot, or colon",
+        )
+    return asset_id
+
+
+def _asset_to_record(asset: SemanticLayerAssetRequest | dict) -> dict:
+    data = _model_to_dict(asset) if isinstance(asset, BaseModel) else dict(asset)
+    asset_id = _validate_asset_id(str(data.get("asset_id", "")))
+    symbol = str(data.get("symbol") or asset_id).strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="asset symbol is required")
+    if len(symbol) > 24:
+        raise HTTPException(status_code=400, detail="asset symbol must be 24 chars or fewer")
+    name = str(data.get("name") or symbol).strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="asset name is required")
+    decimals = int(data.get("decimals", 0))
+    if decimals < 0 or decimals > 18:
+        raise HTTPException(status_code=400, detail="asset decimals must be between 0 and 18")
+    asset_type = str(data.get("asset_type") or "fungible").strip().lower()
+    if not asset_type:
+        raise HTTPException(status_code=400, detail="asset_type is required")
+    metadata = data.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="asset metadata must be an object")
+    return {
+        "asset_id": asset_id,
+        "symbol": symbol,
+        "name": name,
+        "decimals": decimals,
+        "asset_type": asset_type,
+        "metadata": metadata,
+    }
+
+
+def _semantic_layer_assets(sl_id: str, version: str) -> list[dict]:
+    record = STORE.get_semantic_layer(sl_id)
+    if not record or record.get("version") != version:
+        return []
+    return list(record.get("assets") or [])
+
+
+def _resolve_asset_id(
+    sl_id: str,
+    version: str,
+    requested_asset_id: Optional[str] = None,
+) -> str:
+    assets = _semantic_layer_assets(sl_id, version)
+    if requested_asset_id:
+        asset_id = _validate_asset_id(requested_asset_id)
+    elif assets:
+        asset_id = str(assets[0]["asset_id"])
+    else:
+        asset_id = core.DEFAULT_ASSET_ID
+
+    if assets and asset_id not in {asset["asset_id"] for asset in assets}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"asset_id is not registered on semantic layer: {asset_id}",
+        )
+    return asset_id
+
+
+def _asset_action_fields(asset: dict) -> dict:
+    return {
+        "asset_id": asset["asset_id"],
+        "symbol": asset["symbol"],
+        "asset_name": asset["name"],
+        "decimals": asset["decimals"],
+        "asset_type": asset["asset_type"],
+        "metadata": asset.get("metadata", {}),
+    }
 
 
 def _account_json_address(account_json: dict[str, Any]) -> Optional[str]:
@@ -353,12 +448,37 @@ def _resolve_base_layer_account_purpose(
 
 
 def _state_to_response(state: core.State) -> dict:
+    balances_by_asset = {
+        core.DEFAULT_ASSET_ID: dict(sorted(state.balances.items())),
+        **{
+            asset_id: dict(sorted(balances.items()))
+            for asset_id, balances in sorted(state.balances_by_asset.items())
+        },
+    }
+    total_supply_by_asset = {
+        core.DEFAULT_ASSET_ID: state.total_supply,
+        **dict(sorted(state.total_supply_by_asset.items())),
+    }
+    frozen_by_asset = {
+        core.DEFAULT_ASSET_ID: sorted(state.frozen),
+        **{
+            asset_id: sorted(addresses)
+            for asset_id, addresses in sorted(state.frozen_by_asset.items())
+        },
+    }
     return {
         "issuer_vk": state.issuer_vk,
         "balances": dict(sorted(state.balances.items())),
         "total_supply": state.total_supply,
         "nonce": state.nonce,
         "frozen": sorted(state.frozen),
+        "assets": [
+            state.assets[asset_id]
+            for asset_id in sorted(state.assets)
+        ],
+        "balances_by_asset": balances_by_asset,
+        "total_supply_by_asset": total_supply_by_asset,
+        "frozen_by_asset": frozen_by_asset,
         "state_hash": state.state_hash(),
     }
 
@@ -513,6 +633,27 @@ def _queue_action(
         "sl_id": layer_sl_id,
         "version": layer_version,
     }
+
+
+def _queue_asset_registration_if_runtime_exists(
+    asset: dict,
+    sl_id: str,
+    version: str,
+) -> Optional[dict]:
+    if not _initialized(sl_id, version):
+        return None
+
+    state = STORE.load_operator_state(sl_id, version)
+    if state is not None and state.asset_record(asset["asset_id"]):
+        return None
+
+    action = {
+        "type": core.ActionType.REGISTER_ASSET.value,
+        "sender_vk": _issuer_vk(sl_id, version),
+        "nonce": _next_nonce(sl_id, version),
+        **_asset_action_fields(asset),
+    }
+    return _queue_action(action, sl_id, version)
 
 
 def _issuer_vk(
@@ -766,6 +907,7 @@ def operator_init(request: InitRequest) -> dict:
             version=version,
             operator_wallet_address=operator_wallet_address,
             base_layer_account_id=base_layer_account_id,
+            assets=(record or {}).get("assets", []),
             reset_existing=request.reset_existing,
         )
 
@@ -917,6 +1059,12 @@ def register_semantic_layer(request: SemanticLayerRequest) -> dict:
     with STATE_LOCK:
         sl_id = _sl_id_bytes(request.sl_id).hex()
         version = _version_hex(request.version)
+        previous_record = STORE.get_semantic_layer(sl_id)
+        previous_asset_ids = {
+            asset["asset_id"]
+            for asset in (previous_record or {}).get("assets", [])
+            if isinstance(asset, dict) and asset.get("asset_id")
+        }
         operator_address = _validate_address(request.operator_wallet_address)
         operator_wallet = STORE.get_wallet(operator_address)
         if not operator_wallet:
@@ -953,6 +1101,16 @@ def register_semantic_layer(request: SemanticLayerRequest) -> dict:
                     detail="semantic-layer base account must use purpose=sl_operator",
                 )
 
+        fields_set = (
+            request.model_fields_set
+            if hasattr(request, "model_fields_set")
+            else getattr(request, "__fields_set__", set())
+        )
+        assets = (
+            [_asset_to_record(asset) for asset in request.assets]
+            if "assets" in fields_set
+            else list((previous_record or {}).get("assets", []))
+        )
         record = {
             "name": request.name.strip(),
             "sl_id": sl_id,
@@ -961,9 +1119,50 @@ def register_semantic_layer(request: SemanticLayerRequest) -> dict:
             "base_layer_account_id": base_layer_account_id,
             "issuer_vk_ref": request.issuer_vk_ref,
             "operator_vk_ref": request.operator_vk_ref,
+            "assets": assets,
         }
         STORE.upsert_semantic_layer(record)
+        queued = []
+        for asset in record["assets"]:
+            if asset["asset_id"] in previous_asset_ids:
+                continue
+            queued_registration = _queue_asset_registration_if_runtime_exists(asset, sl_id, version)
+            if queued_registration:
+                queued.append(queued_registration["action"])
+        if queued:
+            record["queued_asset_registrations"] = queued
         return record
+
+
+@app.post("/semantic-layers/{sl_id}/assets")
+def register_semantic_layer_asset(
+    sl_id: str,
+    request: SemanticLayerAssetRequest,
+    version: str = Query(default=core.VERSION.hex()),
+) -> dict:
+    with STATE_LOCK:
+        layer_sl_id = _sl_id_bytes(sl_id).hex()
+        layer_version = _version_hex(version)
+        asset = _asset_to_record(request)
+        try:
+            record = STORE.append_semantic_layer_asset(layer_sl_id, layer_version, asset)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
+
+        queued_registration = _queue_asset_registration_if_runtime_exists(
+            asset,
+            layer_sl_id,
+            layer_version,
+        )
+        return {
+            "asset": asset,
+            "semantic_layer": record,
+            "queued_registration": queued_registration["action"] if queued_registration else None,
+            "sl_id": layer_sl_id,
+            "version": layer_version,
+        }
 
 
 @app.get("/semantic-layers")
@@ -977,16 +1176,23 @@ def get_balance(
     source: str = Query(default="verifier", pattern="^(verifier|operator)$"),
     sl_id: Optional[str] = Query(default=None),
     version: Optional[str] = Query(default=None),
+    asset_id: Optional[str] = Query(default=None),
 ) -> dict:
     addr = _validate_address(address)
     if source == "verifier":
         state, resolved_sl_id, resolved_version = _verified_state_for_layer(sl_id, version)
     else:
         state, resolved_sl_id, resolved_version = _operator_state_for_layer(sl_id, version)
+    resolved_asset_id = _resolve_asset_id(
+        resolved_sl_id.hex(),
+        resolved_version.hex(),
+        asset_id,
+    )
     return {
         "address": addr,
-        "balance": state.get_balance(addr),
-        "frozen": addr in state.frozen,
+        "asset_id": resolved_asset_id,
+        "balance": state.get_balance(addr, resolved_asset_id),
+        "frozen": state.is_frozen(addr, resolved_asset_id),
         "source": source,
         "state_hash": state.state_hash(),
         "sl_id": resolved_sl_id.hex(),
@@ -999,10 +1205,12 @@ def mint(request: AmountToRequest) -> dict:
     with STATE_LOCK:
         sl_id, version = _layer_hex(request.sl_id, request.version)
         to_address = _validate_address(request.to_address)
+        asset_id = _resolve_asset_id(sl_id, version, request.asset_id)
         action = {
             "type": core.ActionType.MINT.value,
             "sender_vk": _issuer_vk(sl_id, version),
             "nonce": _next_nonce(sl_id, version),
+            "asset_id": asset_id,
             "to": to_address,
             "amount": request.amount,
         }
@@ -1014,10 +1222,12 @@ def burn(request: AmountFromRequest) -> dict:
     with STATE_LOCK:
         sl_id, version = _layer_hex(request.sl_id, request.version)
         from_address = _validate_address(request.from_address)
+        asset_id = _resolve_asset_id(sl_id, version, request.asset_id)
         action = {
             "type": core.ActionType.BURN.value,
             "sender_vk": _issuer_vk(sl_id, version),
             "nonce": _next_nonce(sl_id, version),
+            "asset_id": asset_id,
             "from_addr": from_address,
             "amount": request.amount,
         }
@@ -1029,10 +1239,12 @@ def freeze(request: TargetRequest) -> dict:
     with STATE_LOCK:
         sl_id, version = _layer_hex(request.sl_id, request.version)
         target_address = _validate_address(request.target_address)
+        asset_id = _resolve_asset_id(sl_id, version, request.asset_id)
         action = {
             "type": core.ActionType.FREEZE.value,
             "sender_vk": _issuer_vk(sl_id, version),
             "nonce": _next_nonce(sl_id, version),
+            "asset_id": asset_id,
             "target": target_address,
         }
         return _queue_action(action, sl_id, version)
@@ -1043,10 +1255,12 @@ def unfreeze(request: TargetRequest) -> dict:
     with STATE_LOCK:
         sl_id, version = _layer_hex(request.sl_id, request.version)
         target_address = _validate_address(request.target_address)
+        asset_id = _resolve_asset_id(sl_id, version, request.asset_id)
         action = {
             "type": core.ActionType.UNFREEZE.value,
             "sender_vk": _issuer_vk(sl_id, version),
             "nonce": _next_nonce(sl_id, version),
+            "asset_id": asset_id,
             "target": target_address,
         }
         return _queue_action(action, sl_id, version)
@@ -1058,6 +1272,7 @@ def transfer(request: TransferRequest) -> dict:
         sl_id, version = _layer_hex(request.sl_id, request.version)
         from_address = _validate_address(request.from_address)
         to_address = _validate_address(request.to_address)
+        asset_id = _resolve_asset_id(sl_id, version, request.asset_id)
         if core.hash_vk(request.vk) != from_address:
             raise HTTPException(status_code=400, detail="vk does not match from_address")
 
@@ -1065,6 +1280,7 @@ def transfer(request: TransferRequest) -> dict:
             "type": core.ActionType.TRANSFER.value,
             "sender_vk": request.vk,
             "nonce": _next_nonce(sl_id, version),
+            "asset_id": asset_id,
             "from_addr": from_address,
             "to": to_address,
             "amount": request.amount,

@@ -91,6 +91,7 @@ GET /base-layer/accounts
 POST /base-layer/accounts/generate
 POST /semantic-layers
 GET /semantic-layers
+POST /semantic-layers/{sl_id}/assets
 GET /balances/{address}
 POST /actions/mint
 POST /actions/burn
@@ -230,6 +231,7 @@ as `base_layer_account_id`.
 ```http
 POST /semantic-layers
 GET /semantic-layers
+POST /semantic-layers/{sl_id}/assets
 ```
 
 Register lightweight semantic-layer metadata:
@@ -242,13 +244,35 @@ Register lightweight semantic-layer metadata:
   "operator_wallet_address": "40_hex_chars",
   "base_layer_account_id": "acct_...",
   "issuer_vk_ref": "local:40_hex_chars",
-  "operator_vk_ref": "local:40_hex_chars"
+  "operator_vk_ref": "local:40_hex_chars",
+  "assets": [
+    {
+      "asset_id": "PAYMENT",
+      "symbol": "USD",
+      "name": "Payment token",
+      "decimals": 6,
+      "asset_type": "fungible"
+    }
+  ]
 }
 ```
 
-These records are workbench metadata. The active Payment SL runtime remains the
-single operational state machine exposed through `/operator/*`, `/actions/*`,
-and `/verifier/*`.
+Semantic-layer records may register multiple asset definitions. Appending an
+asset to an initialized runtime queues a `register_asset` semantic input so the
+operator and verifier see the declaration before asset-specific mints,
+burns, freezes, or transfers.
+
+Append an asset:
+
+```json
+{
+  "asset_id": "BSTK",
+  "symbol": "BSTK",
+  "name": "bStocks",
+  "decimals": 0,
+  "asset_type": "equity"
+}
+```
 
 ### Actions
 
@@ -266,7 +290,8 @@ Mint:
 ```json
 {
   "to_address": "40_hex_chars",
-  "amount": 1000
+  "amount": 1000,
+  "asset_id": "PAYMENT"
 }
 ```
 
@@ -277,12 +302,15 @@ Transfer:
   "from_address": "40_hex_chars",
   "to_address": "40_hex_chars",
   "amount": 250,
-  "vk": "sender_raw_vk_for_sandbox_auth"
+  "vk": "sender_raw_vk_for_sandbox_auth",
+  "asset_id": "PAYMENT"
 }
 ```
 
 Issuer actions use the issuer VK configured at `POST /operator/init`. Transfers
-use the supplied raw VK and reject if it does not hash to `from_address`.
+use the supplied raw VK and reject if it does not hash to `from_address`. When a
+semantic layer has registered assets, omitted `asset_id` defaults to the first
+registered asset for that layer.
 
 ### Operator Batches
 

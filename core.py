@@ -28,7 +28,7 @@ import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +62,7 @@ def hash_vk(vk: str) -> str:
 # ---------------------------------------------------------------------------
 
 class ActionType(Enum):
+    REGISTER_ASSET = "register_asset"
     MINT = "mint"
     BURN = "burn"
     TRANSFER = "transfer"
@@ -69,11 +70,20 @@ class ActionType(Enum):
     UNFREEZE = "unfreeze"
 
 
+DEFAULT_ASSET_ID = "PAYMENT"
+
+
 @dataclass
 class Action:
     action_type: ActionType
     sender_vk: str           # VK of whoever is submitting this action
     nonce: int
+    asset_id: Optional[str] = None
+    symbol: Optional[str] = None
+    asset_name: Optional[str] = None
+    decimals: Optional[int] = None
+    asset_type: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
     to: Optional[str] = None          # address (Hash(VK))
     from_addr: Optional[str] = None
     amount: Optional[int] = None
@@ -86,6 +96,18 @@ class Action:
             "sender_vk": self.sender_vk,
             "nonce": self.nonce,
         }
+        if self.asset_id is not None:
+            payload["asset_id"] = self.asset_id
+        if self.symbol is not None:
+            payload["symbol"] = self.symbol
+        if self.asset_name is not None:
+            payload["asset_name"] = self.asset_name
+        if self.decimals is not None:
+            payload["decimals"] = self.decimals
+        if self.asset_type is not None:
+            payload["asset_type"] = self.asset_type
+        if self.metadata is not None:
+            payload["metadata"] = self.metadata
         if self.to is not None:
             payload["to"] = self.to
         if self.from_addr is not None:
@@ -103,6 +125,18 @@ class Action:
             "sender_vk": self.sender_vk,
             "nonce": self.nonce,
         }
+        if self.asset_id is not None:
+            d["asset_id"] = self.asset_id
+        if self.symbol is not None:
+            d["symbol"] = self.symbol
+        if self.asset_name is not None:
+            d["asset_name"] = self.asset_name
+        if self.decimals is not None:
+            d["decimals"] = self.decimals
+        if self.asset_type is not None:
+            d["asset_type"] = self.asset_type
+        if self.metadata is not None:
+            d["metadata"] = self.metadata
         if self.to is not None:
             d["to"] = self.to
         if self.from_addr is not None:
@@ -119,6 +153,12 @@ class Action:
             action_type=ActionType(d["type"]),
             sender_vk=d["sender_vk"],
             nonce=d["nonce"],
+            asset_id=d.get("asset_id"),
+            symbol=d.get("symbol"),
+            asset_name=d.get("asset_name", d.get("name")),
+            decimals=d.get("decimals"),
+            asset_type=d.get("asset_type"),
+            metadata=d.get("metadata"),
             to=d.get("to"),
             from_addr=d.get("from_addr", d.get("from")),
             amount=d.get("amount"),
@@ -137,16 +177,63 @@ class State:
     total_supply: int = 0
     nonce: int = 0
     frozen: set = field(default_factory=set)        # set of addresses
+    assets: dict = field(default_factory=dict)       # asset_id -> metadata
+    balances_by_asset: dict = field(default_factory=dict)  # asset_id -> address -> u64
+    total_supply_by_asset: dict = field(default_factory=dict)  # asset_id -> u64
+    frozen_by_asset: dict = field(default_factory=dict)  # asset_id -> set(addresses)
+
+    def __post_init__(self) -> None:
+        self.total_supply = int(self.total_supply)
+        self.balances = {addr: int(amount) for addr, amount in self.balances.items()}
+        self.assets = {
+            str(asset_id): dict(metadata)
+            for asset_id, metadata in self.assets.items()
+        }
+        self.balances_by_asset = {
+            str(asset_id): {
+                str(addr): int(amount)
+                for addr, amount in balances.items()
+            }
+            for asset_id, balances in self.balances_by_asset.items()
+        }
+        self.total_supply_by_asset = {
+            str(asset_id): int(amount)
+            for asset_id, amount in self.total_supply_by_asset.items()
+        }
+        self.frozen_by_asset = {
+            str(asset_id): set(addresses)
+            for asset_id, addresses in self.frozen_by_asset.items()
+        }
 
     def state_hash(self) -> str:
         """Commitment to current state — H(canonical serialization)."""
-        canonical = json.dumps({
+        canonical_state = {
             "issuer_vk": self.issuer_vk,
             "balances": dict(sorted(self.balances.items())),
             "total_supply": self.total_supply,
             "nonce": self.nonce,
             "frozen": sorted(list(self.frozen)),
-        }, separators=(",", ":"))
+        }
+        if self.assets:
+            canonical_state["assets"] = {
+                asset_id: self.assets[asset_id]
+                for asset_id in sorted(self.assets)
+            }
+        if self.balances_by_asset:
+            canonical_state["balances_by_asset"] = {
+                asset_id: dict(sorted(balances.items()))
+                for asset_id, balances in sorted(self.balances_by_asset.items())
+            }
+        if self.total_supply_by_asset:
+            canonical_state["total_supply_by_asset"] = dict(
+                sorted(self.total_supply_by_asset.items())
+            )
+        if self.frozen_by_asset:
+            canonical_state["frozen_by_asset"] = {
+                asset_id: sorted(list(addresses))
+                for asset_id, addresses in sorted(self.frozen_by_asset.items())
+            }
+        canonical = json.dumps(canonical_state, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def clone(self) -> "State":
@@ -156,29 +243,128 @@ class State:
             total_supply=self.total_supply,
             nonce=self.nonce,
             frozen=set(self.frozen),
+            assets=json.loads(json.dumps(self.assets)),
+            balances_by_asset={
+                asset_id: dict(balances)
+                for asset_id, balances in self.balances_by_asset.items()
+            },
+            total_supply_by_asset=dict(self.total_supply_by_asset),
+            frozen_by_asset={
+                asset_id: set(addresses)
+                for asset_id, addresses in self.frozen_by_asset.items()
+            },
         )
 
-    def get_balance(self, addr: str) -> int:
-        return self.balances.get(addr, 0)
+    def register_asset(self, asset: dict[str, Any]) -> None:
+        asset_id = str(asset["asset_id"])
+        normalized = {
+            "asset_id": asset_id,
+            "symbol": str(asset.get("symbol") or asset_id),
+            "name": str(asset.get("name") or asset.get("asset_name") or asset_id),
+            "decimals": int(asset.get("decimals", 0)),
+            "asset_type": str(asset.get("asset_type") or "fungible"),
+            "metadata": dict(asset.get("metadata") or {}),
+        }
+        self.assets[asset_id] = normalized
+        if asset_id != DEFAULT_ASSET_ID:
+            self.balances_by_asset.setdefault(asset_id, {})
+            self.total_supply_by_asset.setdefault(asset_id, 0)
+            self.frozen_by_asset.setdefault(asset_id, set())
+
+    def asset_record(self, asset_id: str) -> Optional[dict]:
+        return self.assets.get(asset_id)
+
+    def get_balance(self, addr: str, asset_id: Optional[str] = None) -> int:
+        key = asset_id or DEFAULT_ASSET_ID
+        if key == DEFAULT_ASSET_ID:
+            return self.balances.get(addr, 0)
+        return self.balances_by_asset.get(key, {}).get(addr, 0)
+
+    def set_balance(self, addr: str, amount: int, asset_id: Optional[str] = None) -> None:
+        key = asset_id or DEFAULT_ASSET_ID
+        if key == DEFAULT_ASSET_ID:
+            self.balances[addr] = int(amount)
+            return
+        self.balances_by_asset.setdefault(key, {})
+        self.balances_by_asset[key][addr] = int(amount)
+
+    def get_total_supply(self, asset_id: Optional[str] = None) -> int:
+        key = asset_id or DEFAULT_ASSET_ID
+        if key == DEFAULT_ASSET_ID:
+            return self.total_supply
+        return self.total_supply_by_asset.get(key, 0)
+
+    def set_total_supply(self, amount: int, asset_id: Optional[str] = None) -> None:
+        key = asset_id or DEFAULT_ASSET_ID
+        if key == DEFAULT_ASSET_ID:
+            self.total_supply = int(amount)
+            return
+        self.total_supply_by_asset[key] = int(amount)
+
+    def is_frozen(self, addr: str, asset_id: Optional[str] = None) -> bool:
+        key = asset_id or DEFAULT_ASSET_ID
+        if key == DEFAULT_ASSET_ID:
+            return addr in self.frozen
+        return addr in self.frozen_by_asset.get(key, set())
+
+    def freeze_address(self, addr: str, asset_id: Optional[str] = None) -> None:
+        key = asset_id or DEFAULT_ASSET_ID
+        if key == DEFAULT_ASSET_ID:
+            self.frozen.add(addr)
+            return
+        self.frozen_by_asset.setdefault(key, set()).add(addr)
+
+    def unfreeze_address(self, addr: str, asset_id: Optional[str] = None) -> None:
+        key = asset_id or DEFAULT_ASSET_ID
+        if key == DEFAULT_ASSET_ID:
+            self.frozen.discard(addr)
+            return
+        self.frozen_by_asset.setdefault(key, set()).discard(addr)
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "issuer_vk": self.issuer_vk,
             "balances": dict(sorted(self.balances.items())),
             "total_supply": self.total_supply,
             "nonce": self.nonce,
             "frozen": sorted(list(self.frozen)),
-            "state_hash": self.state_hash(),
         }
+        if self.assets:
+            data["assets"] = {
+                asset_id: self.assets[asset_id]
+                for asset_id in sorted(self.assets)
+            }
+        if self.balances_by_asset:
+            data["balances_by_asset"] = {
+                asset_id: dict(sorted(balances.items()))
+                for asset_id, balances in sorted(self.balances_by_asset.items())
+            }
+        if self.total_supply_by_asset:
+            data["total_supply_by_asset"] = dict(sorted(self.total_supply_by_asset.items()))
+        if self.frozen_by_asset:
+            data["frozen_by_asset"] = {
+                asset_id: sorted(list(addresses))
+                for asset_id, addresses in sorted(self.frozen_by_asset.items())
+            }
+        data["state_hash"] = self.state_hash()
+        return data
 
     @classmethod
     def from_dict(cls, d: dict) -> "State":
+        frozen_by_asset = d.get("frozen_by_asset", {})
         return cls(
             issuer_vk=d["issuer_vk"],
             balances=dict(d.get("balances", {})),
             total_supply=d.get("total_supply", 0),
             nonce=d.get("nonce", 0),
             frozen=set(d.get("frozen", [])),
+            assets=dict(d.get("assets", {})),
+            balances_by_asset=dict(d.get("balances_by_asset", {})),
+            total_supply_by_asset=dict(d.get("total_supply_by_asset", {})),
+            frozen_by_asset={
+                asset_id: set(addresses)
+                for asset_id, addresses in frozen_by_asset.items()
+            },
         )
 
 
@@ -212,33 +398,64 @@ def apply_action(state: State, action: Action) -> State:
             f"Invalid nonce: expected {s.nonce + 1}, got {action.nonce}"
         )
 
-    if action.action_type == ActionType.MINT:
+    asset_id = action.asset_id or DEFAULT_ASSET_ID
+
+    if action.action_type == ActionType.REGISTER_ASSET:
+        if action.sender_vk != s.issuer_vk:
+            raise TransitionError("Only issuer can register assets")
+        if not action.asset_id:
+            raise TransitionError("Asset registration requires 'asset_id'")
+        if action.asset_id in s.assets:
+            raise TransitionError(f"Asset already registered: {action.asset_id}")
+        s.register_asset(
+            {
+                "asset_id": action.asset_id,
+                "symbol": action.symbol or action.asset_id,
+                "name": action.asset_name or action.symbol or action.asset_id,
+                "decimals": action.decimals or 0,
+                "asset_type": action.asset_type or "fungible",
+                "metadata": action.metadata or {},
+            }
+        )
+        s.nonce = action.nonce
+
+    elif action.action_type == ActionType.MINT:
         if action.sender_vk != s.issuer_vk:
             raise TransitionError("Only issuer can mint")
+        if asset_id != DEFAULT_ASSET_ID and not s.asset_record(asset_id):
+            raise TransitionError(f"Unknown asset: {asset_id}")
         if action.amount is None or action.amount <= 0:
             raise TransitionError("Mint amount must be positive")
         if action.to is None:
             raise TransitionError("Mint requires 'to' address")
-        s.balances[action.to] = s.get_balance(action.to) + action.amount
-        s.total_supply += action.amount
+        s.set_balance(action.to, s.get_balance(action.to, asset_id) + action.amount, asset_id)
+        s.set_total_supply(s.get_total_supply(asset_id) + action.amount, asset_id)
         s.nonce = action.nonce
 
     elif action.action_type == ActionType.BURN:
         if action.sender_vk != s.issuer_vk:
             raise TransitionError("Only issuer can burn")
+        if asset_id != DEFAULT_ASSET_ID and not s.asset_record(asset_id):
+            raise TransitionError(f"Unknown asset: {asset_id}")
         if action.amount is None or action.amount <= 0:
             raise TransitionError("Burn amount must be positive")
         if action.from_addr is None:
             raise TransitionError("Burn requires 'from_addr'")
-        if s.get_balance(action.from_addr) < action.amount:
+        if s.get_balance(action.from_addr, asset_id) < action.amount:
             raise TransitionError(
-                f"Insufficient balance: {s.get_balance(action.from_addr)} < {action.amount}"
+                f"Insufficient balance: {s.get_balance(action.from_addr, asset_id)} < {action.amount}"
             )
-        s.balances[action.from_addr] -= action.amount
-        s.total_supply -= action.amount
+        s.set_balance(
+            action.from_addr,
+            s.get_balance(action.from_addr, asset_id) - action.amount,
+            asset_id,
+        )
+        s.set_total_supply(s.get_total_supply(asset_id) - action.amount, asset_id)
         s.nonce = action.nonce
 
     elif action.action_type == ActionType.TRANSFER:
+        if asset_id != DEFAULT_ASSET_ID and not s.asset_record(asset_id):
+            raise TransitionError(f"Unknown asset: {asset_id}")
         if action.from_addr is None or action.to is None:
             raise TransitionError("Transfer requires 'from_addr' and 'to'")
         if action.amount is None or action.amount <= 0:
@@ -248,32 +465,40 @@ def apply_action(state: State, action: Action) -> State:
             raise TransitionError(
                 f"Sender {sender_addr} does not match from_addr {action.from_addr}"
             )
-        if action.from_addr in s.frozen:
+        if s.is_frozen(action.from_addr, asset_id):
             raise TransitionError(f"Address {action.from_addr} is frozen")
-        if action.to in s.frozen:
+        if s.is_frozen(action.to, asset_id):
             raise TransitionError(f"Address {action.to} is frozen")
-        if s.get_balance(action.from_addr) < action.amount:
+        if s.get_balance(action.from_addr, asset_id) < action.amount:
             raise TransitionError(
-                f"Insufficient balance: {s.get_balance(action.from_addr)} < {action.amount}"
+                f"Insufficient balance: {s.get_balance(action.from_addr, asset_id)} < {action.amount}"
             )
-        s.balances[action.from_addr] -= action.amount
-        s.balances[action.to] = s.get_balance(action.to) + action.amount
+        s.set_balance(
+            action.from_addr,
+            s.get_balance(action.from_addr, asset_id) - action.amount,
+            asset_id,
+        )
+        s.set_balance(action.to, s.get_balance(action.to, asset_id) + action.amount, asset_id)
         s.nonce = action.nonce
 
     elif action.action_type == ActionType.FREEZE:
         if action.sender_vk != s.issuer_vk:
             raise TransitionError("Only issuer can freeze")
+        if asset_id != DEFAULT_ASSET_ID and not s.asset_record(asset_id):
+            raise TransitionError(f"Unknown asset: {asset_id}")
         if action.target is None:
             raise TransitionError("Freeze requires 'target' address")
-        s.frozen.add(action.target)
+        s.freeze_address(action.target, asset_id)
         s.nonce = action.nonce
 
     elif action.action_type == ActionType.UNFREEZE:
         if action.sender_vk != s.issuer_vk:
             raise TransitionError("Only issuer can unfreeze")
+        if asset_id != DEFAULT_ASSET_ID and not s.asset_record(asset_id):
+            raise TransitionError(f"Unknown asset: {asset_id}")
         if action.target is None:
             raise TransitionError("Unfreeze requires 'target' address")
-        s.frozen.discard(action.target)
+        s.unfreeze_address(action.target, asset_id)
         s.nonce = action.nonce
 
     else:
