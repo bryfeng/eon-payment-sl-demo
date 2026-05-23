@@ -166,6 +166,49 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(alice_balance["balance"], 60)
         self.assertEqual(bob_balance["balance"], 40)
 
+    def test_accept_latest_batch_catches_up_unverified_sequences(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        bob = self._wallet("Bob", "bob_vk")
+
+        response = self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["sequence"], 1)
+
+        response = self.client.post(
+            "/actions/transfer",
+            json={
+                "from_address": alice["address"],
+                "to_address": bob["address"],
+                "amount": 40,
+                "vk": "alice_vk",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["sequence"], 2)
+
+        response = self.client.post("/verifier/accept-latest-batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["sequence"], 2)
+        self.assertEqual(response.json()["accepted_sequences"], [1, 2])
+
+        alice_balance = self.client.get(f"/balances/{alice['address']}").json()
+        bob_balance = self.client.get(f"/balances/{bob['address']}").json()
+        self.assertEqual(alice_balance["balance"], 60)
+        self.assertEqual(bob_balance["balance"], 40)
+
+        response = self.client.post("/verifier/accept-latest-batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["sequence"], 2)
+        self.assertEqual(response.json()["accepted_sequences"], [])
+
     def test_semantic_layer_runtime_state_is_scoped_by_layer(self):
         alice = self._wallet("Alice", "alice_vk")
         sl_a = SL_ID.hex()

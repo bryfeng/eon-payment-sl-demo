@@ -353,9 +353,12 @@ GET /verifier/events
 POST /verifier/ingest-event
 ```
 
-`POST /verifier/accept-latest-batch` is the fastest sandbox path. It takes the
-latest operator batch, builds the decoded envelope, replays Payment SL rules,
-checks sequence continuity, and writes verifier-indexed state.
+`POST /verifier/accept-latest-batch` is the fastest sandbox path. It advances
+the verifier from its current checkpoint through the latest operator batch in
+sequence order, builds decoded envelopes, replays Payment SL rules, checks
+sequence continuity, and writes verifier-indexed state. If the latest batch is
+already accepted, the call is a no-op and returns an empty `accepted_sequences`
+array.
 
 `POST /verifier/accept-envelope` accepts the explicit decoded envelope shape:
 

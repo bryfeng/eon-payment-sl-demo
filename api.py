@@ -688,6 +688,17 @@ def _latest_batch(
     return batch
 
 
+def _batch_envelope(batch: dict) -> dict:
+    return {
+        "prev_state": batch["prev_state"],
+        "sequence": batch["sequence"],
+        "prev_state_hash": batch["prev_state_hash"],
+        "new_state_hash": batch["new_state_hash"],
+        "actions_applied": batch["actions_applied"],
+        "payload_hex": batch["payload_hex"],
+    }
+
+
 def _active_runtime_config(
     sl_id: Optional[str] = None,
     version: Optional[str] = None,
@@ -1549,23 +1560,57 @@ def verifier_accept_latest_batch(
 ) -> dict:
     with STATE_LOCK:
         layer_sl_id, layer_version = _layer_hex(sl_id, version)
-        batch = _latest_batch(layer_sl_id, layer_version)
-        envelope = {
-            "prev_state": batch["prev_state"],
-            "sequence": batch["sequence"],
-            "prev_state_hash": batch["prev_state_hash"],
-            "new_state_hash": batch["new_state_hash"],
-            "actions_applied": batch["actions_applied"],
-            "payload_hex": batch["payload_hex"],
-        }
-        valid, msg = _accept_envelope(envelope, layer_sl_id, layer_version)
-        if not valid:
-            raise HTTPException(status_code=400, detail=msg)
+        batches = STORE.list_batches(layer_sl_id, layer_version)
+        if not batches:
+            raise HTTPException(status_code=404, detail="no operator batch found")
+
+        plugin = _payment_plugin(layer_sl_id, layer_version)
+        checkpoint = _verifier_store().load_checkpoint(plugin.sl_id, plugin.version)
+        expected_sequence = 1 if checkpoint is None else int(checkpoint["sequence"]) + 1
+        latest_sequence = int(batches[-1]["sequence"])
+
+        if expected_sequence > latest_sequence:
+            return {
+                "accepted": True,
+                "message": "latest batch already accepted",
+                "sequence": latest_sequence,
+                "accepted_sequences": [],
+                "verifier_state": _state_to_response(_verified_state(layer_sl_id, layer_version)),
+                "sl_id": layer_sl_id,
+                "version": layer_version,
+            }
+
+        batch_by_sequence = {int(batch["sequence"]): batch for batch in batches}
+        accepted_sequences: list[int] = []
+        last_sequence = expected_sequence - 1
+
+        for sequence in range(expected_sequence, latest_sequence + 1):
+            batch = batch_by_sequence.get(sequence)
+            if batch is None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"missing operator batch for expected sequence {sequence}",
+                )
+
+            valid, msg = _accept_envelope(
+                _batch_envelope(batch),
+                layer_sl_id,
+                layer_version,
+            )
+            if not valid:
+                raise HTTPException(status_code=400, detail=msg)
+            accepted_sequences.append(sequence)
+            last_sequence = sequence
 
         return {
             "accepted": True,
-            "message": msg,
-            "sequence": envelope["sequence"],
+            "message": (
+                "accepted"
+                if len(accepted_sequences) == 1
+                else f"accepted {len(accepted_sequences)} batches"
+            ),
+            "sequence": last_sequence,
+            "accepted_sequences": accepted_sequences,
             "verifier_state": _state_to_response(_verified_state(layer_sl_id, layer_version)),
             "sl_id": layer_sl_id,
             "version": layer_version,
