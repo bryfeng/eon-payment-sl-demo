@@ -253,6 +253,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(pending_b.status_code, 200, pending_b.text)
         self.assertEqual(len(pending_a.json()["pending"]), 1)
         self.assertEqual(len(pending_b.json()["pending"]), 1)
+        all_pending = self.client.get("/pending/all")
+        self.assertEqual(all_pending.status_code, 200, all_pending.text)
+        self.assertEqual(all_pending.json()["count"], 2)
+        self.assertEqual(
+            [(item["sl_id"], item["action"]["amount"]) for item in all_pending.json()["pending"]],
+            [(sl_a, 100), (sl_b, 500)],
+        )
 
         response = self.client.post(f"/operator/batch?sl_id={sl_a}&version={version}")
         self.assertEqual(response.status_code, 200, response.text)

@@ -1570,6 +1570,15 @@ def pending(
     }
 
 
+@app.get("/pending/all")
+def pending_all() -> dict:
+    pending_actions = STORE.load_all_pending()
+    return {
+        "pending": pending_actions,
+        "count": len(pending_actions),
+    }
+
+
 @app.post("/operator/batch")
 def operator_batch(
     sl_id: Optional[str] = Query(default=None),

@@ -740,6 +740,24 @@ class SQLiteStorage:
             ).fetchall()
         return [_loads(row["action_json"]) for row in rows]
 
+    def load_all_pending(self) -> list[dict]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT sl_id, version, action_json FROM sl_pending_actions
+                ORDER BY id
+                """
+            ).fetchall()
+
+        return [
+            {
+                "sl_id": row["sl_id"],
+                "version": row["version"],
+                "action": _loads(row["action_json"]),
+            }
+            for row in rows
+        ]
+
     def pending_count(
         self,
         sl_id: str = core.SL_ID.hex(),

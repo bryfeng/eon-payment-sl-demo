@@ -100,6 +100,7 @@ POST /actions/freeze
 POST /actions/unfreeze
 POST /actions/transfer
 GET /pending
+GET /pending/all
 POST /operator/batch
 GET /operator/batches
 GET /operator/latest-payload
@@ -291,6 +292,7 @@ POST /actions/freeze
 POST /actions/unfreeze
 POST /actions/transfer
 GET /pending
+GET /pending/all
 ```
 
 Mint:
