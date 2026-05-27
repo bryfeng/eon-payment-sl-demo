@@ -91,6 +91,7 @@ GET /base-layer/accounts
 POST /base-layer/accounts/generate
 POST /semantic-layers
 GET /semantic-layers
+GET /semantic-layers/workbench-state
 POST /semantic-layers/{sl_id}/assets
 GET /balances/{address}
 POST /actions/mint
@@ -231,6 +232,7 @@ as `base_layer_account_id`.
 ```http
 POST /semantic-layers
 GET /semantic-layers
+GET /semantic-layers/workbench-state
 POST /semantic-layers/{sl_id}/assets
 ```
 
@@ -261,6 +263,12 @@ Semantic-layer records may register multiple asset definitions. Appending an
 asset to an initialized runtime queues a `register_asset` semantic input so the
 operator and verifier see the declaration before asset-specific mints,
 burns, freezes, or transfers.
+
+`GET /semantic-layers/workbench-state` returns the canonical playground
+projection for a selected semantic layer. It combines registry metadata,
+resolved operator signer account, effective assets, pending semantic inputs,
+batches, latest payload, verifier state, devnet readiness, and balances for
+registered wallets plus any repeated `wallet_address` query parameters.
 
 Append an asset:
 

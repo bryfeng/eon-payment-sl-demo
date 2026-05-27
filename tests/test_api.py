@@ -672,6 +672,77 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(runtimes[0]["base_layer_account_id"], base_account["id"])
         self.assertEqual(runtimes[0]["next_sequence"], 1)
 
+    def test_semantic_layer_workbench_state_projects_runtime_payload_state(self):
+        self._init()
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+        alice = self._wallet("Alice", "alice_vk")
+
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": VERSION.hex(),
+                "operator_wallet_address": operator["address"],
+                "base_layer_account_id": base_account["id"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 4200},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get(
+            f"/semantic-layers/workbench-state?sl_id={SL_ID.hex()}&version={VERSION.hex()}&wallet_address={alice['address']}"
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["health"]["initialized"])
+        self.assertEqual(body["selected_layer"]["effective_record"]["name"], "Payment SL")
+        self.assertEqual(body["selected_layer"]["base_layer_account"]["id"], base_account["id"])
+        self.assertEqual(body["selected_layer"]["assets"][0]["asset_id"], "PAYMENT")
+        self.assertTrue(body["selected_layer"]["runtime_initialized"])
+        self.assertEqual(body["runtime"]["operator_state"]["state"]["total_supply"], 4200)
+        self.assertEqual(body["runtime"]["latest_payload"]["sequence"], 1)
+        self.assertEqual(body["runtime"]["balances"][alice["address"]]["operator"]["balance"], 4200)
+
+    def test_semantic_layer_workbench_state_resolves_operator_signer_fallback(self):
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+        sl_id = "00010003"
+
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": sl_id,
+                "version": VERSION.hex(),
+                "operator_wallet_address": operator["address"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get(
+            f"/semantic-layers/workbench-state?sl_id={sl_id}&version={VERSION.hex()}"
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertFalse(body["selected_layer"]["runtime_initialized"])
+        self.assertEqual(body["selected_layer"]["signer_status"], "ready")
+        self.assertEqual(body["selected_layer"]["base_layer_account"]["id"], base_account["id"])
+        self.assertEqual(body["selected_layer"]["assets"][0]["asset_id"], "PAYMENT")
+        self.assertEqual(body["runtime"]["pending_actions"], [])
+        self.assertIsNone(body["runtime"]["operator_state"])
+
     def test_semantic_layer_rejects_invalid_operator_address(self):
         response = self.client.post(
             "/semantic-layers",

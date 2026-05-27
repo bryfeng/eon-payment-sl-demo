@@ -7,6 +7,7 @@ can be hosted on a persistent Railway volume.
 """
 
 import sqlite3
+import re
 from threading import RLock
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -267,6 +268,29 @@ def _asset_to_record(asset: SemanticLayerAssetRequest | dict) -> dict:
         "asset_type": asset_type,
         "metadata": metadata,
     }
+
+
+def _default_asset_for_layer(record: Optional[dict]) -> dict:
+    name = str((record or {}).get("name") or "Payment SL").strip()
+    symbol_source = re.sub(r"\s+SL$", "", name, flags=re.IGNORECASE)
+    symbol = re.sub(r"[^A-Z0-9_.:-]", "_", symbol_source.upper()).strip("_")[:12] or "ASSET"
+    return {
+        "asset_id": core.DEFAULT_ASSET_ID,
+        "symbol": symbol,
+        "name": f"{name} asset" if name else "Payment token",
+        "decimals": 0,
+        "asset_type": "fungible",
+        "metadata": {},
+    }
+
+
+def _effective_assets(record: Optional[dict], state: Optional[core.State] = None) -> list[dict]:
+    assets = list((record or {}).get("assets") or [])
+    if assets:
+        return assets
+    if state and state.assets:
+        return [state.assets[asset_id] for asset_id in sorted(state.assets)]
+    return [_default_asset_for_layer(record)]
 
 
 def _semantic_layer_assets(sl_id: str, version: str) -> list[dict]:
@@ -727,6 +751,111 @@ def _active_semantic_layer_record(
     return None
 
 
+def _workbench_layer_coordinates(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> tuple[str, str]:
+    if sl_id is not None or version is not None:
+        return _layer_hex(sl_id, version)
+
+    active_config = _active_runtime_config()
+    if active_config:
+        return str(active_config["sl_id"]), str(active_config["version"])
+
+    layers = STORE.list_semantic_layers()
+    if layers:
+        return str(layers[0]["sl_id"]), str(layers[0]["version"])
+
+    return core.SL_ID.hex(), core.VERSION.hex()
+
+
+def _resolved_base_layer_account(
+    record: Optional[dict],
+    runtime_config: Optional[dict],
+) -> Optional[dict]:
+    account_id = (
+        (record or {}).get("base_layer_account_id")
+        or (runtime_config or {}).get("base_layer_account_id")
+    )
+    if account_id:
+        account = STORE.get_base_layer_account(str(account_id))
+        if account:
+            return _public_base_layer_account(account)
+
+    operator_address = (
+        (record or {}).get("operator_wallet_address")
+        or (runtime_config or {}).get("operator_wallet_address")
+    )
+    if not operator_address:
+        return None
+
+    return next(
+        (
+            _public_base_layer_account(account)
+            for account in STORE.list_base_layer_accounts()
+            if account.get("owner_wallet_address") == operator_address
+            and account.get("purpose") == "sl_operator"
+        ),
+        None,
+    )
+
+
+def _balance_projection(
+    address: str,
+    state: core.State,
+    source: str,
+    sl_id: str,
+    version: str,
+    asset_id: str,
+) -> dict:
+    return {
+        "address": address,
+        "asset_id": asset_id,
+        "balance": state.get_balance(address, asset_id),
+        "frozen": state.is_frozen(address, asset_id),
+        "source": source,
+        "state_hash": state.state_hash(),
+        "sl_id": sl_id,
+        "version": version,
+    }
+
+
+def _latest_payload_projection(batch: Optional[dict], sl_id: str, version: str) -> Optional[dict]:
+    if not batch:
+        return None
+    return {
+        "sequence": batch["sequence"],
+        "payload_hex": batch["payload_hex"],
+        "payload_size": batch["payload_size"],
+        "data_scalars": batch["data_scalars"],
+        "data_len": batch["data_len"],
+        "sl_id": sl_id,
+        "version": version,
+    }
+
+
+def _config_response() -> dict:
+    active_config = _active_runtime_config()
+    active_sl_id = str(active_config["sl_id"]) if active_config else core.SL_ID.hex()
+    active_version = str(active_config["version"]) if active_config else core.VERSION.hex()
+    response = {
+        "initialized": bool(active_config),
+        "sl_id": active_sl_id,
+        "version": active_version,
+        "runtimes": STORE.list_runtime_configs(),
+        "storage": {
+            "type": "sqlite",
+            "db_path": str(STORE.db_path),
+        },
+    }
+    if active_config:
+        operator_state = STORE.load_operator_state(active_sl_id, active_version)
+        response["issuer_vk"] = active_config["issuer_vk"]
+        response["operator_state_hash"] = operator_state.state_hash() if operator_state else None
+        response["next_batch_sequence"] = STORE.next_batch_sequence(active_sl_id, active_version)
+    return response
+
+
 def _devnet_runtime_status(
     sl_id: Optional[str] = None,
     version: Optional[str] = None,
@@ -822,25 +951,7 @@ def root() -> dict:
 
 @app.get("/config")
 def config() -> dict:
-    active_config = _active_runtime_config()
-    active_sl_id = str(active_config["sl_id"]) if active_config else core.SL_ID.hex()
-    active_version = str(active_config["version"]) if active_config else core.VERSION.hex()
-    response = {
-        "initialized": bool(active_config),
-        "sl_id": active_sl_id,
-        "version": active_version,
-        "runtimes": STORE.list_runtime_configs(),
-        "storage": {
-            "type": "sqlite",
-            "db_path": str(STORE.db_path),
-        },
-    }
-    if active_config:
-        operator_state = STORE.load_operator_state(active_sl_id, active_version)
-        response["issuer_vk"] = active_config["issuer_vk"]
-        response["operator_state_hash"] = operator_state.state_hash() if operator_state else None
-        response["next_batch_sequence"] = STORE.next_batch_sequence(active_sl_id, active_version)
-    return response
+    return _config_response()
 
 
 @app.post("/reset")
@@ -1179,6 +1290,152 @@ def register_semantic_layer_asset(
 @app.get("/semantic-layers")
 def list_semantic_layers() -> dict:
     return {"semantic_layers": STORE.list_semantic_layers()}
+
+
+@app.get("/semantic-layers/workbench-state")
+def semantic_layer_workbench_state(
+    sl_id: Optional[str] = Query(default=None),
+    version: Optional[str] = Query(default=None),
+    wallet_address: list[str] = Query(default_factory=list),
+) -> dict:
+    layer_sl_id, layer_version = _workbench_layer_coordinates(sl_id, version)
+    semantic_layers = STORE.list_semantic_layers()
+    base_layer_accounts = [
+        _public_base_layer_account(record)
+        for record in STORE.list_base_layer_accounts()
+    ]
+    server_wallets = STORE.list_wallets()
+    runtime_config = STORE.load_sl_config(layer_sl_id, layer_version)
+    record = next(
+        (
+            layer
+            for layer in semantic_layers
+            if layer["sl_id"] == layer_sl_id and layer["version"] == layer_version
+        ),
+        None,
+    )
+    operator_state = STORE.load_operator_state(layer_sl_id, layer_version)
+    verifier_state = None
+    verifier_sl_id_bytes = bytes.fromhex(layer_sl_id)
+    verifier_version_bytes = bytes.fromhex(layer_version)
+
+    try:
+        verifier_state, verifier_sl_id_bytes, verifier_version_bytes = _verified_state_for_layer(
+            layer_sl_id,
+            layer_version,
+        )
+    except HTTPException:
+        verifier_state = None
+
+    pending_actions = STORE.load_pending(layer_sl_id, layer_version) if runtime_config else []
+    batches = STORE.list_batches(layer_sl_id, layer_version) if runtime_config else []
+    latest_batch = batches[-1] if batches else None
+    verifier_log = _verifier_store().list_verification_log(
+        verifier_sl_id_bytes,
+        verifier_version_bytes,
+    )
+    base_layer_account = _resolved_base_layer_account(record, runtime_config)
+    operator_wallet_address = (
+        (record or {}).get("operator_wallet_address")
+        or (runtime_config or {}).get("operator_wallet_address")
+    )
+    operator_wallet = STORE.get_wallet(operator_wallet_address) if operator_wallet_address else None
+    effective_record = {
+        "name": (record or {}).get("name") or f"SL {layer_sl_id}",
+        "sl_id": layer_sl_id,
+        "version": layer_version,
+        "operator_wallet_address": operator_wallet_address,
+        "base_layer_account_id": (
+            (record or {}).get("base_layer_account_id")
+            or (runtime_config or {}).get("base_layer_account_id")
+            or (base_layer_account or {}).get("id")
+        ),
+        "issuer_vk_ref": (record or {}).get("issuer_vk_ref"),
+        "operator_vk_ref": (record or {}).get("operator_vk_ref"),
+        "assets": _effective_assets(record, operator_state),
+        "created_at": (record or {}).get("created_at"),
+        "updated_at": (record or {}).get("updated_at"),
+    }
+    asset_id = _resolve_asset_id(layer_sl_id, layer_version)
+    balance_addresses = {wallet["address"] for wallet in server_wallets}
+    balance_addresses.update(_validate_address(address) for address in wallet_address)
+    balances = {}
+    for address in sorted(balance_addresses):
+        pair = {}
+        if operator_state is not None:
+            pair["operator"] = _balance_projection(
+                address,
+                operator_state,
+                "operator",
+                layer_sl_id,
+                layer_version,
+                asset_id,
+            )
+        if verifier_state is not None:
+            pair["verifier"] = _balance_projection(
+                address,
+                verifier_state,
+                "verifier",
+                layer_sl_id,
+                layer_version,
+                asset_id,
+            )
+        balances[address] = pair
+
+    return {
+        "health": health(),
+        "config": _config_response(),
+        "server_wallets": server_wallets,
+        "semantic_layers": semantic_layers,
+        "base_layer_accounts": base_layer_accounts,
+        "devnet_status": _devnet_runtime_status(layer_sl_id, layer_version),
+        "selected_layer": {
+            "sl_id": layer_sl_id,
+            "version": layer_version,
+            "record": record,
+            "effective_record": effective_record,
+            "operator_wallet": operator_wallet,
+            "base_layer_account": base_layer_account,
+            "assets": effective_record["assets"],
+            "runtime_config": runtime_config,
+            "runtime_initialized": bool(runtime_config and operator_state),
+            "signer_status": (
+                "bound"
+                if (record or {}).get("base_layer_account_id")
+                else "ready" if base_layer_account else "missing"
+            ),
+        },
+        "runtime": {
+            "operator_state": (
+                {
+                    "state": _state_to_response(operator_state),
+                    "pending_count": len(pending_actions),
+                    "next_batch_sequence": STORE.next_batch_sequence(layer_sl_id, layer_version),
+                    "sl_id": layer_sl_id,
+                    "version": layer_version,
+                }
+                if operator_state is not None
+                else None
+            ),
+            "verifier_state": (
+                {
+                    "sl_id": verifier_sl_id_bytes.hex(),
+                    "version": verifier_version_bytes.hex(),
+                    "state": _state_to_response(verifier_state),
+                    "accepted_payloads": len(
+                        [entry for entry in verifier_log if entry.get("verdict") == "accepted"]
+                    ),
+                }
+                if verifier_state is not None
+                else None
+            ),
+            "pending_actions": pending_actions,
+            "batches": batches,
+            "latest_payload": _latest_payload_projection(latest_batch, layer_sl_id, layer_version),
+            "verifier_log": verifier_log,
+            "balances": balances,
+        },
+    }
 
 
 @app.get("/balances/{address}")
