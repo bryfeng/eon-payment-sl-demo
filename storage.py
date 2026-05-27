@@ -777,7 +777,27 @@ class SQLiteStorage:
     ) -> int:
         with self.connect() as conn:
             config = self._get_runtime_config(conn, sl_id, version)
-        return int((config or {}).get("next_sequence", 1))
+            candidates = [int((config or {}).get("next_sequence", 1))]
+
+            scoped_row = conn.execute(
+                """
+                SELECT MAX(sequence) AS max_sequence
+                FROM sl_operator_batches
+                WHERE sl_id = ? AND version = ?
+                """,
+                (sl_id, version),
+            ).fetchone()
+            if scoped_row and scoped_row["max_sequence"] is not None:
+                candidates.append(int(scoped_row["max_sequence"]) + 1)
+
+            if sl_id == core.SL_ID.hex() and version == core.VERSION.hex():
+                legacy_row = conn.execute(
+                    "SELECT MAX(sequence) AS max_sequence FROM operator_batches"
+                ).fetchone()
+                if legacy_row and legacy_row["max_sequence"] is not None:
+                    candidates.append(int(legacy_row["max_sequence"]) + 1)
+
+        return max(candidates)
 
     def next_nonce(
         self,

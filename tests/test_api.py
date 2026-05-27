@@ -319,6 +319,43 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertFalse(response.json()["batched"])
 
+    def test_batch_sequence_recovers_from_stale_runtime_counter(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+
+        response = self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["sequence"], 1)
+
+        with api.STORE.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sl_runtime_configs
+                SET next_sequence = 1
+                WHERE sl_id = ? AND version = ?
+                """,
+                (SL_ID.hex(), VERSION.hex()),
+            )
+
+        response = self.client.get("/operator/state")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["next_batch_sequence"], 2)
+
+        response = self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 25},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["sequence"], 2)
+        self.assertEqual(response.json()["operator_state"]["total_supply"], 125)
+
     def test_wallet_registration_can_accept_address_only(self):
         self._init()
         address = hash_vk("external_vk")
