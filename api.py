@@ -870,7 +870,15 @@ def _devnet_runtime_status(
     vault_ready = vault_configured()
     pool_counts = STORE.base_layer_account_pool_counts()
     account_generator_ready = bool(vault_ready and pool_counts["available"] > 0)
-    account_ready = bool(status.get("wallet_file_configured") or (active_account_id and vault_ready))
+    base_layer_api_recipient_ready = bool(
+        status.get("base_layer_transfer_recipient_configured")
+        or status.get("base_layer_wallet_address")
+    )
+    account_ready = bool(
+        status.get("wallet_file_configured")
+        or base_layer_api_recipient_ready
+        or (active_account_id and vault_ready)
+    )
     submitter_ready = bool(status.get("submitter_configured", status.get("enabled")))
 
     status.update(
@@ -1730,10 +1738,15 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
         try:
             status = _devnet_runtime_status(sl_id, version)
             if not status["ready"]:
+                submitter_error = status.get("submitter_error")
+                if submitter_error:
+                    raise DevnetSubmitError(
+                        f"EON devnet submitter is misconfigured: {submitter_error}"
+                    )
                 if not status.get("submitter_configured"):
                     raise DevnetSubmitError(
-                        "EON devnet submission is not configured. Set EON_DEVNET_SUBMIT_CMD "
-                        "to a command that signs and submits the payload transaction."
+                        "EON devnet submission is not configured. Set BASE_LAYER_API_URL "
+                        "to the iovi-api service or configure legacy EON_DEVNET_SUBMIT_CMD."
                     )
                 if (
                     status.get("active_base_layer_account_id")

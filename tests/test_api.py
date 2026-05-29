@@ -2,7 +2,9 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -23,7 +25,20 @@ class ApiTests(unittest.TestCase):
             "EON_DEVNET_API_URL": os.environ.get("EON_DEVNET_API_URL"),
             "EON_OPERATOR_WALLET_FILE": os.environ.get("EON_OPERATOR_WALLET_FILE"),
             "EON_KEY_ENCRYPTION_SECRET": os.environ.get("EON_KEY_ENCRYPTION_SECRET"),
+            "BASE_LAYER_API_URL": os.environ.get("BASE_LAYER_API_URL"),
+            "BASE_LAYER_API_KEY": os.environ.get("BASE_LAYER_API_KEY"),
+            "BASE_LAYER_TRANSFER_RECIPIENT": os.environ.get("BASE_LAYER_TRANSFER_RECIPIENT"),
+            "BASE_LAYER_TRANSFER_FEE": os.environ.get("BASE_LAYER_TRANSFER_FEE"),
+            "BASE_LAYER_TRANSFER_AMOUNT": os.environ.get("BASE_LAYER_TRANSFER_AMOUNT"),
         }
+        for key in (
+            "BASE_LAYER_API_URL",
+            "BASE_LAYER_API_KEY",
+            "BASE_LAYER_TRANSFER_RECIPIENT",
+            "BASE_LAYER_TRANSFER_FEE",
+            "BASE_LAYER_TRANSFER_AMOUNT",
+        ):
+            os.environ.pop(key, None)
         api.configure_storage(Path(self.tmp.name))
         self.client = TestClient(api.app)
 
@@ -82,6 +97,77 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
+
+    def _mock_base_layer_api(
+        self,
+        expected_key="base-secret",
+        wallet_address="0x" + "9" * 64,
+    ):
+        calls = {"transfers": []}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def _send_json(self, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    self._send_json(
+                        200,
+                        {
+                            "status": "ok",
+                            "service": "eon-base-layer-api",
+                            "wallet_configured": True,
+                        },
+                    )
+                    return
+                if self.path == "/wallet/address":
+                    self._send_json(
+                        200,
+                        {
+                            "address": wallet_address,
+                            "address_bech32": "eon1mock",
+                            "account_type": "normal",
+                        },
+                    )
+                    return
+                self._send_json(404, {"error": "not found"})
+
+            def do_POST(self):
+                if self.path != "/transactions/transfer":
+                    self._send_json(404, {"error": "not found"})
+                    return
+                if self.headers.get("x-api-key") != expected_key:
+                    self._send_json(401, {"error": "unauthorized"})
+                    return
+                content_length = int(self.headers.get("content-length", "0"))
+                body = json.loads(self.rfile.read(content_length).decode("utf-8"))
+                calls["transfers"].append(body)
+                self._send_json(
+                    200,
+                    {
+                        "hash": "0xbasehash",
+                        "submitted": True,
+                    },
+                )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def cleanup():
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(cleanup)
+        return f"http://127.0.0.1:{server.server_port}", calls
 
     def test_root_liveness_message(self):
         response = self.client.get("/")
@@ -917,6 +1003,116 @@ class ApiTests(unittest.TestCase):
         finally:
             if previous is not None:
                 os.environ["EON_DEVNET_SUBMIT_CMD"] = previous
+
+    def test_devnet_submission_rejects_placeholder_submitter(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.client.post("/operator/batch")
+
+        previous = os.environ.get("EON_DEVNET_SUBMIT_CMD")
+        os.environ["EON_DEVNET_SUBMIT_CMD"] = (
+            "cargo run --quiet --manifest-path /path/to/eon-sdk/Cargo.toml "
+            "--example post_payment_sl_payload"
+        )
+        try:
+            response = self.client.get("/devnet/status")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertFalse(response.json()["enabled"])
+            self.assertFalse(response.json()["submitter_configured"])
+            self.assertTrue(response.json()["submitter_command_configured"])
+            self.assertIn("/path/to", response.json()["submitter_error"])
+
+            response = self.client.post("/devnet/submit-latest-batch", json={})
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("misconfigured", response.json()["detail"])
+        finally:
+            if previous is None:
+                os.environ.pop("EON_DEVNET_SUBMIT_CMD", None)
+            else:
+                os.environ["EON_DEVNET_SUBMIT_CMD"] = previous
+
+    def test_devnet_submission_posts_to_base_layer_api(self):
+        self._init()
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": operator["address"],
+                "base_layer_account_id": base_account["id"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        batch_response = self.client.post("/operator/batch")
+        self.assertEqual(batch_response.status_code, 200, batch_response.text)
+        batch = batch_response.json()["batch"]
+
+        base_url, calls = self._mock_base_layer_api()
+        os.environ.pop("EON_DEVNET_SUBMIT_CMD", None)
+        os.environ["BASE_LAYER_API_URL"] = base_url
+        os.environ["BASE_LAYER_API_KEY"] = "base-secret"
+        os.environ["BASE_LAYER_TRANSFER_FEE"] = "2"
+
+        status = self.client.get("/devnet/status")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["enabled"])
+        self.assertEqual(status.json()["submitter"], "base_layer_api")
+        self.assertTrue(status.json()["base_layer_api_reachable"])
+        self.assertTrue(status.json()["base_layer_wallet_configured"])
+
+        response = self.client.post("/devnet/submit-latest-batch", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+
+        self.assertEqual(len(calls["transfers"]), 1)
+        transfer = calls["transfers"][0]
+        self.assertEqual(transfer["recipient"], base_account["eon_address"])
+        self.assertEqual(transfer["amount"], batch["data_len"])
+        self.assertEqual(transfer["fee"], 2)
+        self.assertEqual(transfer["data"], batch["data_scalars"])
+
+        submission = response.json()["devnet_submission"]
+        self.assertEqual(submission["status"], "submitted")
+        self.assertEqual(submission["submitter"], "base_layer_api")
+        self.assertEqual(submission["tx_hash"], "0xbasehash")
+        self.assertEqual(submission["owner"], base_account["eon_address"])
+        self.assertEqual(submission["payload_hex"], batch["payload_hex"])
+
+    def test_devnet_submission_can_use_base_layer_api_wallet_as_recipient(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.client.post("/operator/batch")
+
+        wallet_address = "0x" + "9" * 64
+        base_url, calls = self._mock_base_layer_api(wallet_address=wallet_address)
+        os.environ.pop("EON_DEVNET_SUBMIT_CMD", None)
+        os.environ["BASE_LAYER_API_URL"] = base_url
+        os.environ["BASE_LAYER_API_KEY"] = "base-secret"
+
+        status = self.client.get("/devnet/status")
+        self.assertEqual(status.status_code, 200, status.text)
+        self.assertTrue(status.json()["enabled"])
+        self.assertEqual(status.json()["base_layer_wallet_address"], wallet_address)
+
+        response = self.client.post("/devnet/submit-latest-batch", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(calls["transfers"][0]["recipient"], wallet_address)
 
     def test_devnet_submission_records_tx_metadata(self):
         self._init()
