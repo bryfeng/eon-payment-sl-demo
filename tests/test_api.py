@@ -1136,7 +1136,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(calls["transfers"]), 1)
         transfer = calls["transfers"][0]
         self.assertEqual(transfer["recipient"], base_account["eon_address"])
-        self.assertEqual(transfer["amount"], batch["data_len"])
+        self.assertEqual(transfer["amount"], 1)
         self.assertEqual(transfer["fee"], 2)
         self.assertEqual(transfer["data"], batch["data_scalars"])
 

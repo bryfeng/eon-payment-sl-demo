@@ -337,7 +337,7 @@ def submit_batch_via_base_layer_api(
     account_json: Optional[dict[str, Any]] = None,
 ) -> dict:
     recipient = resolve_base_layer_recipient(config, account_json)
-    amount = config.base_layer_transfer_amount or max(1, int(batch["data_len"]))
+    amount = config.base_layer_transfer_amount or 1
     fee = config.base_layer_transfer_fee
     request = {
         "recipient": recipient,
