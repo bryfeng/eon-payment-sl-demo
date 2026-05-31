@@ -1158,6 +1158,54 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["state"]["state_hash"], batch["new_state_hash"])
 
+    def test_devnet_submission_can_target_historical_batch(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        bob = self._wallet("Bob", "bob_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        first_response = self.client.post("/operator/batch")
+        self.assertEqual(first_response.status_code, 200, first_response.text)
+        first_batch = first_response.json()["batch"]
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": bob["address"], "amount": 50},
+        )
+        second_response = self.client.post("/operator/batch")
+        self.assertEqual(second_response.status_code, 200, second_response.text)
+        second_batch = second_response.json()["batch"]
+
+        base_url, calls = self._mock_base_layer_api()
+        os.environ.pop("EON_DEVNET_SUBMIT_CMD", None)
+        os.environ["BASE_LAYER_API_URL"] = base_url
+        os.environ["BASE_LAYER_API_KEY"] = "base-secret"
+
+        response = self.client.post(
+            "/devnet/submit-latest-batch",
+            json={
+                "sequence": first_batch["sequence"],
+                "wait_for_verifier": False,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["sequence"], first_batch["sequence"])
+        self.assertEqual(response.json()["batch"]["sequence"], first_batch["sequence"])
+        self.assertEqual(calls["transfers"][0]["data"], first_batch["data_scalars"])
+
+        response = self.client.post(
+            "/devnet/submit-latest-batch",
+            json={
+                "sequence": second_batch["sequence"],
+                "wait_for_verifier": False,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["sequence"], second_batch["sequence"])
+        self.assertEqual(response.json()["batch"]["sequence"], second_batch["sequence"])
+        self.assertEqual(calls["transfers"][1]["data"], second_batch["data_scalars"])
+
     def test_devnet_submission_can_use_base_layer_api_wallet_as_recipient(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")

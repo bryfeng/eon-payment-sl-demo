@@ -158,6 +158,7 @@ class PayloadRequest(BaseModel):
 
 class DevnetSubmitRequest(BaseModel):
     force: bool = False
+    sequence: Optional[int] = Field(default=None, ge=1)
     sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
     version: str = Field(default=core.VERSION.hex(), min_length=1)
     wait_for_verifier: bool = True
@@ -726,6 +727,20 @@ def _latest_batch(
     if batch is None:
         raise HTTPException(status_code=404, detail="no operator batch found")
     return batch
+
+
+def _batch_for_submission(
+    sl_id: str,
+    version: str,
+    sequence: Optional[int] = None,
+) -> dict:
+    if sequence is None:
+        return _latest_batch(sl_id, version)
+
+    for batch in STORE.list_batches(sl_id, version):
+        if int(batch["sequence"]) == sequence:
+            return batch
+    raise HTTPException(status_code=404, detail=f"operator batch {sequence} not found")
 
 
 def _batch_envelope(batch: dict) -> dict:
@@ -1887,12 +1902,12 @@ def get_devnet_status(
 def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
     with STATE_LOCK:
         sl_id, version = _layer_hex(request.sl_id, request.version)
-        batch = _latest_batch(sl_id, version)
+        batch = _batch_for_submission(sl_id, version, request.sequence)
         existing = batch.get("devnet_submission")
         if existing and existing.get("status") == "submitted" and not request.force:
             raise HTTPException(
                 status_code=409,
-                detail="latest batch is already submitted to devnet; pass force=true to resubmit",
+                detail=f"batch {batch['sequence']} is already submitted to devnet; pass force=true to resubmit",
             )
 
         try:
