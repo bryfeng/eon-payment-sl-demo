@@ -1072,6 +1072,7 @@ class ApiTests(unittest.TestCase):
         batch_response = self.client.post("/operator/batch")
         self.assertEqual(batch_response.status_code, 200, batch_response.text)
         batch = batch_response.json()["batch"]
+        self.assertEqual(batch["status"], "batched")
 
         base_url, calls = self._mock_base_layer_api()
         os.environ.pop("EON_DEVNET_SUBMIT_CMD", None)
@@ -1102,6 +1103,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(submission["tx_hash"], "0xbasehash")
         self.assertEqual(submission["owner"], base_account["eon_address"])
         self.assertEqual(submission["payload_hex"], batch["payload_hex"])
+        self.assertEqual(response.json()["batch"]["status"], "verified")
 
         verification = response.json()["verification"]
         self.assertTrue(verification["verified"])
@@ -1231,6 +1233,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         recorded = response.json()["batches"][0]["devnet_submission"]
         self.assertEqual(recorded["tx_hash"], "0xtxhash")
+        self.assertEqual(response.json()["batches"][0]["status"], "submitted")
 
         response = self.client.post("/devnet/submit-latest-batch", json={})
         self.assertEqual(response.status_code, 409)

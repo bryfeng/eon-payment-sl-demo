@@ -339,6 +339,7 @@ operator state, and returns:
 {
   "batched": true,
   "batch": {
+    "status": "batched",
     "sequence": 1,
     "prev_state_hash": "hex",
     "new_state_hash": "hex",
@@ -467,6 +468,10 @@ transaction metadata on the batch record. By default it then triggers a bounded
 verifier sync: poll every `5` seconds for up to `120` seconds, ending early once
 the verifier checkpoint reaches the submitted batch sequence and state hash.
 Pass `wait_for_verifier: false` to return immediately after submission.
+Batch records expose a top-level lifecycle `status`: `batched` before base-layer
+submission, `submitted` after a tx hash is stored, `verified` after verifier
+checkpoint acceptance, or `verification_timeout` when the bounded verifier sync
+does not observe the expected checkpoint in time.
 
 The legacy command path is configured with `EON_DEVNET_SUBMIT_CMD`; it receives
 JSON on stdin with `api_url`, `sequence`, `payload_hex`, and `data_scalars`,

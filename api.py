@@ -1768,6 +1768,7 @@ def operator_batch(
             for idx, action in enumerate(pending_actions)
         ]
         record = {
+            "status": "batched",
             "sequence": result.sequence,
             "action_count": result.action_count,
             "applied": result.applied,

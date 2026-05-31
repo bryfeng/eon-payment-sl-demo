@@ -260,6 +260,7 @@ class SQLiteStorage:
 
         record = _loads(row["record_json"])
         record["devnet_submission"] = submission
+        record["status"] = "submitted"
         conn.execute(
             """
             UPDATE sl_operator_batches
@@ -276,6 +277,7 @@ class SQLiteStorage:
             if legacy_row is not None:
                 legacy_record = _loads(legacy_row["record_json"])
                 legacy_record["devnet_submission"] = submission
+                legacy_record["status"] = "submitted"
                 conn.execute(
                     """
                     UPDATE operator_batches
@@ -306,6 +308,11 @@ class SQLiteStorage:
 
         record = _loads(row["record_json"])
         record["verification"] = verification
+        record["status"] = (
+            "verified"
+            if verification.get("verified")
+            else "verification_timeout"
+        )
         conn.execute(
             """
             UPDATE sl_operator_batches
@@ -322,6 +329,7 @@ class SQLiteStorage:
             if legacy_row is not None:
                 legacy_record = _loads(legacy_row["record_json"])
                 legacy_record["verification"] = verification
+                legacy_record["status"] = record["status"]
                 conn.execute(
                     """
                     UPDATE operator_batches
