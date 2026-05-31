@@ -306,11 +306,12 @@ class SQLiteStorage:
         if row is None:
             raise KeyError(f"batch {sequence} not found")
 
+        stored_verification = _loads(_dumps(verification))
         record = _loads(row["record_json"])
-        record["verification"] = verification
+        record["verification"] = stored_verification
         record["status"] = (
             "verified"
-            if verification.get("verified")
+            if stored_verification.get("verified")
             else "verification_timeout"
         )
         conn.execute(

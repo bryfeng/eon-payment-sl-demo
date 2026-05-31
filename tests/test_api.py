@@ -995,6 +995,49 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(len(response.json()["events"]), 1)
 
+    def test_verifier_sync_records_existing_batch_verification(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        batch_response = self.client.post("/operator/batch")
+        self.assertEqual(batch_response.status_code, 200, batch_response.text)
+        batch = batch_response.json()["batch"]
+
+        base_url, calls = self._mock_base_layer_api()
+        calls["utxos"].append(
+            {
+                "id": "0xutxo1",
+                "tx_hash": "0xtx1",
+                "output_index": 0,
+                "amount": batch["data_len"],
+                "owner": "0xposter",
+                "data": batch["data_scalars"],
+            }
+        )
+        os.environ["BASE_LAYER_API_URL"] = base_url
+
+        response = self.client.post(
+            "/verifier/sync",
+            json={
+                "sl_id": SL_ID.hex(),
+                "version": VERSION.hex(),
+                "posting_owner": "0xposter",
+                "expected_sequence": batch["sequence"],
+                "expected_state_hash": batch["new_state_hash"],
+                "timeout_seconds": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["verified"])
+        self.assertEqual(response.json()["batch"]["status"], "verified")
+
+        response = self.client.get("/operator/batches")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batches"][0]["status"], "verified")
+
     def test_devnet_submission_requires_configured_submitter(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")

@@ -1075,6 +1075,33 @@ def _sync_verifier_from_base_layer_api(
     }
 
 
+def _record_verification_for_checkpoint_batch(
+    sl_id: str,
+    version: str,
+    verification: dict,
+) -> Optional[dict]:
+    checkpoint = verification.get("checkpoint") or {}
+    if not verification.get("verified") or not checkpoint:
+        return None
+
+    checkpoint_sequence = int(checkpoint["sequence"])
+    checkpoint_hash = str(checkpoint["state_hash"])
+    matching_batch = None
+    for batch in STORE.list_batches(sl_id, version):
+        if int(batch["sequence"]) == checkpoint_sequence:
+            matching_batch = batch
+            break
+    if matching_batch is None or matching_batch.get("new_state_hash") != checkpoint_hash:
+        return None
+
+    return STORE.record_batch_verification(
+        checkpoint_sequence,
+        verification,
+        sl_id,
+        version,
+    )
+
+
 @app.get("/health")
 def health() -> dict:
     return {"ok": True, "initialized": _initialized()}
@@ -1997,7 +2024,7 @@ def verifier_ingest_event(event: BaseEventRequest) -> dict:
 def verifier_sync(request: VerifierSyncRequest) -> dict:
     sl_id, version = _layer_hex(request.sl_id, request.version)
     try:
-        return _sync_verifier_from_base_layer_api(
+        result = _sync_verifier_from_base_layer_api(
             sl_id,
             version,
             posting_owner=request.posting_owner,
@@ -2006,6 +2033,10 @@ def verifier_sync(request: VerifierSyncRequest) -> dict:
             timeout_seconds=request.timeout_seconds,
             poll_interval_seconds=request.poll_interval_seconds,
         )
+        updated_batch = _record_verification_for_checkpoint_batch(sl_id, version, result)
+        if updated_batch is not None:
+            result["batch"] = updated_batch
+        return result
     except DevnetSubmitError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
 
