@@ -135,11 +135,19 @@ class PaymentSLTests(unittest.TestCase):
         envelope = self._valid_envelope()
         payload = bytes.fromhex(envelope["payload_hex"])
         scalars = payload_bytes_to_scalar_hex(payload)
+        self.assertTrue(all(int(scalar, 16) < 0x40000000 for scalar in scalars[1:]))
         self.assertEqual(scalar_hex_to_payload_bytes(scalars), payload)
 
         prev_state = State.from_dict(envelope["prev_state"])
         from_scalars = envelope_from_scalars(scalars, prev_state)
         self.assertEqual(from_scalars, envelope)
+
+    def test_devnet_scalar_framing_preserves_high_bytes(self):
+        payload = bytes(range(256)) + b"\xff" * 97
+        scalars = payload_bytes_to_scalar_hex(payload)
+
+        self.assertEqual(scalar_hex_to_payload_bytes(scalars), payload)
+        self.assertTrue(all(int(scalar, 16) < 0x40000000 for scalar in scalars[1:]))
 
     def test_adapter_rejects_wrong_previous_state(self):
         envelope = self._valid_envelope()

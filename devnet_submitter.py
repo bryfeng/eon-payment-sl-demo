@@ -19,6 +19,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from verifier_engine.eon_data import payload_bytes_to_scalar_hex, payload_hex_to_bytes
+
 
 DEFAULT_DEVNET_API_URL = "https://eon.zk524.com"
 
@@ -258,14 +260,16 @@ def submit_batch_to_devnet(
             f"EON devnet submitter is misconfigured: {submitter_error}"
         )
 
+    data_scalars = submission_data_scalars(batch)
+    data_len = len(data_scalars)
     request = {
         "network_id": "devnet",
         "api_url": config.api_url,
         "sequence": batch["sequence"],
         "payload_hex": batch["payload_hex"],
         "payload_size": batch["payload_size"],
-        "data_scalars": batch["data_scalars"],
-        "data_len": batch["data_len"],
+        "data_scalars": data_scalars,
+        "data_len": data_len,
     }
 
     env = os.environ.copy()
@@ -326,8 +330,8 @@ def submit_batch_to_devnet(
         "amount": str(response.get("amount", response.get("data_amount", batch["data_len"]))),
         "response": response.get("response", "ok"),
         "payload_hex": batch["payload_hex"],
-        "data_len": batch["data_len"],
-        "data_scalars": batch["data_scalars"],
+        "data_len": data_len,
+        "data_scalars": data_scalars,
     }
 
 
@@ -337,13 +341,15 @@ def submit_batch_via_base_layer_api(
     account_json: Optional[dict[str, Any]] = None,
 ) -> dict:
     recipient = resolve_base_layer_recipient(config, account_json)
-    amount = config.base_layer_transfer_amount or max(1, int(batch["data_len"]))
+    data_scalars = submission_data_scalars(batch)
+    data_len = len(data_scalars)
+    amount = config.base_layer_transfer_amount or max(1, data_len)
     fee = config.base_layer_transfer_fee
     request = {
         "recipient": recipient,
         "amount": amount,
         "fee": fee,
-        "data": batch["data_scalars"],
+        "data": data_scalars,
     }
     response = _base_layer_api_json(
         config,
@@ -371,9 +377,13 @@ def submit_batch_via_base_layer_api(
         "amount": str(response.get("amount", amount)),
         "response": response.get("response", "ok" if response.get("submitted") else response),
         "payload_hex": batch["payload_hex"],
-        "data_len": batch["data_len"],
-        "data_scalars": batch["data_scalars"],
+        "data_len": data_len,
+        "data_scalars": data_scalars,
     }
+
+
+def submission_data_scalars(batch: dict) -> list[str]:
+    return payload_bytes_to_scalar_hex(payload_hex_to_bytes(str(batch["payload_hex"])))
 
 
 def resolve_base_layer_recipient(
