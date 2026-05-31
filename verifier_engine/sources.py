@@ -6,6 +6,8 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Protocol
 
+from .eon_data import scalar_hex_to_payload_bytes
+
 
 class EventSource(Protocol):
     def events_after(self, cursor: str | None = None) -> Iterable[dict]:
@@ -55,7 +57,7 @@ class BaseLayerAPIEventSource:
 
     def events_after(self, cursor: str | None = None) -> Iterable[dict]:
         del cursor
-        for index, utxo in enumerate(self._utxos()):
+        for index, utxo in enumerate(self._sorted_utxos()):
             data_scalars = utxo.get("data") or utxo.get("data_scalars") or []
             if not data_scalars:
                 continue
@@ -103,3 +105,22 @@ class BaseLayerAPIEventSource:
         if not isinstance(parsed, list):
             raise RuntimeError("base-layer API GET /utxos returned non-list JSON")
         return [item for item in parsed if isinstance(item, dict)]
+
+    def _sorted_utxos(self) -> list[dict]:
+        return sorted(
+            self._utxos(),
+            key=lambda utxo: (
+                self._payload_sequence(utxo),
+                str(utxo.get("id") or utxo.get("utxo_id") or ""),
+            ),
+        )
+
+    def _payload_sequence(self, utxo: dict) -> int:
+        data_scalars = utxo.get("data") or utxo.get("data_scalars") or []
+        try:
+            payload = scalar_hex_to_payload_bytes(data_scalars)
+        except Exception:
+            return 2**63 - 1
+        if len(payload) < 14:
+            return 2**63 - 1
+        return int.from_bytes(payload[6:14], "big")

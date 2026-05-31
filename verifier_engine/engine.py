@@ -17,8 +17,8 @@ class VerifierEngine:
         self.plugin_config = plugin_config or {}
 
     def ingest_event(self, event: dict) -> dict:
-        event_key, inserted = self.store.append_base_event(event)
-        if not inserted:
+        event_key, exists = self.store.has_base_event(event)
+        if exists:
             return {
                 "stored": True,
                 "duplicate": True,
@@ -32,6 +32,7 @@ class VerifierEngine:
             payload = scalar_hex_to_payload_bytes(event.get("data_scalars", []))
             sl_id, version = payload_header(payload)
         except Exception as e:
+            event_key, _inserted = self.store.append_base_event(event)
             return {
                 "stored": True,
                 "duplicate": False,
@@ -43,6 +44,7 @@ class VerifierEngine:
 
         plugin = self.registry.get(sl_id, version)
         if plugin is None:
+            event_key, _inserted = self.store.append_base_event(event)
             return {
                 "stored": True,
                 "duplicate": False,
@@ -56,6 +58,47 @@ class VerifierEngine:
 
         transition = plugin.parse_payload(payload)
         checkpoint = self.store.load_checkpoint(sl_id, version)
+        expected_sequence = 1 if checkpoint is None else int(checkpoint["sequence"]) + 1
+        sequence = int(transition["sequence"])
+        if sequence > expected_sequence:
+            return {
+                "stored": False,
+                "duplicate": False,
+                "event_key": event_key,
+                "accepted": False,
+                "ignored": True,
+                "deferred": True,
+                "sl_id": sl_id.hex(),
+                "version": version.hex(),
+                "sequence": sequence,
+                "expected_sequence": expected_sequence,
+                "message": f"waiting for sequence {expected_sequence}",
+            }
+        if sequence < expected_sequence:
+            return {
+                "stored": False,
+                "duplicate": False,
+                "event_key": event_key,
+                "accepted": False,
+                "ignored": True,
+                "sl_id": sl_id.hex(),
+                "version": version.hex(),
+                "sequence": sequence,
+                "expected_sequence": expected_sequence,
+                "message": f"sequence {sequence} is already behind checkpoint {checkpoint['sequence']}",
+            }
+
+        event_key, inserted = self.store.append_base_event(event)
+        if not inserted:
+            return {
+                "stored": True,
+                "duplicate": True,
+                "event_key": event_key,
+                "accepted": False,
+                "ignored": True,
+                "message": "base event already ingested",
+            }
+
         if checkpoint is None:
             prev_state = plugin.genesis_state(self.plugin_config.get(sl_id.hex(), {}))
         else:

@@ -173,6 +173,15 @@ class VerifierStore:
             except sqlite3.IntegrityError:
                 return event_key, False
 
+    def has_base_event(self, event: dict) -> tuple[str, bool]:
+        event_key = str(event.get("event_key") or self._event_key(event))
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM base_events WHERE event_key = ?",
+                (event_key,),
+            ).fetchone()
+        return event_key, row is not None
+
     def list_base_events(
         self,
         after: Optional[str] = None,

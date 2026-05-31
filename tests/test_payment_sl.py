@@ -44,6 +44,20 @@ class PaymentSLTests(unittest.TestCase):
             "payload_hex": result.data_field_payload().hex(),
         }
 
+    def _event_for_envelope(self, envelope, suffix="1"):
+        return {
+            "cursor": f"devnet:{suffix}:0:0",
+            "network_id": "devnet",
+            "height": int(suffix),
+            "tx_hash": f"0xtx{suffix}",
+            "tx_index": 0,
+            "output_index": 0,
+            "utxo_id": f"0xutxo{suffix}",
+            "owner": "0xowner",
+            "amount": "1",
+            "data_scalars": payload_bytes_to_scalar_hex(bytes.fromhex(envelope["payload_hex"])),
+        }
+
     def test_envelope_verifies(self):
         valid, msg = verify_envelope(self._valid_envelope())
         self.assertTrue(valid, msg)
@@ -144,18 +158,7 @@ class PaymentSLTests(unittest.TestCase):
 
     def test_engine_ingests_payment_event_and_is_idempotent(self):
         envelope = self._valid_envelope()
-        event = {
-            "cursor": "devnet:1:0:0",
-            "network_id": "devnet",
-            "height": 1,
-            "tx_hash": "0xtx",
-            "tx_index": 0,
-            "output_index": 0,
-            "utxo_id": "0xutxo",
-            "owner": "0xowner",
-            "amount": "1",
-            "data_scalars": payload_bytes_to_scalar_hex(bytes.fromhex(envelope["payload_hex"])),
-        }
+        event = self._event_for_envelope(envelope)
 
         with tempfile.TemporaryDirectory() as tmp:
             store = VerifierStore(Path(tmp) / "verifier.sqlite")
@@ -172,6 +175,56 @@ class PaymentSLTests(unittest.TestCase):
         self.assertTrue(first["accepted"], first)
         self.assertTrue(second["duplicate"], second)
         self.assertEqual(checkpoint["state_hash"], envelope["new_state_hash"])
+
+    def test_engine_defers_future_sequence_without_poisoning_event(self):
+        issuer = "issuer_vk"
+        alice = hash_vk("alice_vk")
+        genesis = State(issuer_vk=issuer)
+        state_one, result_one = process_batch(
+            genesis,
+            [Action(ActionType.MINT, issuer, 1, to=alice, amount=100)],
+            sequence=1,
+        )
+        _state_two, result_two = process_batch(
+            state_one,
+            [Action(ActionType.MINT, issuer, 2, to=alice, amount=50)],
+            sequence=2,
+        )
+        envelope_one = {
+            "prev_state": genesis.to_dict(),
+            "sequence": result_one.sequence,
+            "prev_state_hash": result_one.prev_state_hash,
+            "new_state_hash": result_one.new_state_hash,
+            "actions_applied": [action.to_dict() for action in result_one.actions],
+            "payload_hex": result_one.data_field_payload().hex(),
+        }
+        envelope_two = {
+            "prev_state": state_one.to_dict(),
+            "sequence": result_two.sequence,
+            "prev_state_hash": result_two.prev_state_hash,
+            "new_state_hash": result_two.new_state_hash,
+            "actions_applied": [action.to_dict() for action in result_two.actions],
+            "payload_hex": result_two.data_field_payload().hex(),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            engine = VerifierEngine(
+                store,
+                PluginRegistry([PAYMENT_PLUGIN]),
+                {PAYMENT_PLUGIN.sl_id.hex(): {"issuer_vk": issuer}},
+            )
+
+            deferred = engine.ingest_event(self._event_for_envelope(envelope_two, "2"))
+            first = engine.ingest_event(self._event_for_envelope(envelope_one, "1"))
+            second = engine.ingest_event(self._event_for_envelope(envelope_two, "2"))
+            checkpoint = store.load_checkpoint(PAYMENT_PLUGIN.sl_id, next(iter(PAYMENT_PLUGIN.supported_versions)))
+
+        self.assertTrue(deferred["deferred"], deferred)
+        self.assertFalse(deferred["stored"], deferred)
+        self.assertTrue(first["accepted"], first)
+        self.assertTrue(second["accepted"], second)
+        self.assertEqual(checkpoint["state_hash"], envelope_two["new_state_hash"])
 
     def test_unknown_sl_id_event_is_stored_not_verified(self):
         payload = b"\xff\xff\xff\xff\x00\x01ignored"
