@@ -258,6 +258,36 @@ class PaymentSLTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(log, [])
 
+    def test_malformed_payment_event_does_not_block_later_valid_event(self):
+        envelope = self._valid_envelope()
+        malformed_payload = PAYMENT_PLUGIN.sl_id + next(iter(PAYMENT_PLUGIN.supported_versions)) + b"bad"
+        malformed_event = {
+            "cursor": "devnet:bad:0:0",
+            "network_id": "devnet",
+            "height": 1,
+            "tx_hash": "0xbad",
+            "tx_index": 0,
+            "output_index": 0,
+            "data_scalars": payload_bytes_to_scalar_hex(malformed_payload),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            engine = VerifierEngine(
+                store,
+                PluginRegistry([PAYMENT_PLUGIN]),
+                {PAYMENT_PLUGIN.sl_id.hex(): {"issuer_vk": "issuer_vk"}},
+            )
+
+            ignored = engine.ingest_event(malformed_event)
+            accepted = engine.ingest_event(self._event_for_envelope(envelope))
+            checkpoint = store.load_checkpoint(PAYMENT_PLUGIN.sl_id, next(iter(PAYMENT_PLUGIN.supported_versions)))
+
+        self.assertTrue(ignored["ignored"], ignored)
+        self.assertIn("could not parse semantic-layer payload", ignored["message"])
+        self.assertTrue(accepted["accepted"], accepted)
+        self.assertEqual(checkpoint["state_hash"], envelope["new_state_hash"])
+
 
 if __name__ == "__main__":
     unittest.main()

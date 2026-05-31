@@ -56,7 +56,20 @@ class VerifierEngine:
                 "message": "no semantic-layer plugin registered",
             }
 
-        transition = plugin.parse_payload(payload)
+        try:
+            transition = plugin.parse_payload(payload)
+        except Exception as e:
+            event_key, _inserted = self.store.append_base_event(event)
+            return {
+                "stored": True,
+                "duplicate": False,
+                "event_key": event_key,
+                "accepted": False,
+                "ignored": True,
+                "sl_id": sl_id.hex(),
+                "version": version.hex(),
+                "message": f"could not parse semantic-layer payload: {e}",
+            }
         checkpoint = self.store.load_checkpoint(sl_id, version)
         expected_sequence = 1 if checkpoint is None else int(checkpoint["sequence"]) + 1
         sequence = int(transition["sequence"])
