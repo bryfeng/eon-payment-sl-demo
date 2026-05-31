@@ -110,6 +110,7 @@ POST /devnet/submit-latest-batch
 GET /verifier/state
 GET /verifier/log
 GET /verifier/events
+POST /verifier/sync
 POST /verifier/accept-latest-batch
 POST /verifier/accept-envelope
 POST /verifier/envelope-from-payload
@@ -360,6 +361,7 @@ POST /verifier/envelope-from-payload
 GET /verifier/state
 GET /verifier/log
 GET /verifier/events
+POST /verifier/sync
 POST /verifier/ingest-event
 ```
 
@@ -383,8 +385,29 @@ array.
 }
 ```
 
+`POST /verifier/sync` polls the configured base-layer API UTXO surface, ingests
+data-bearing outputs as normalized verifier events, and optionally waits for a
+specific sequence/state hash:
+
+```json
+{
+  "sl_id": "00010001",
+  "version": "0001",
+  "posting_owner": "0x64_hex_chars",
+  "expected_sequence": 8,
+  "expected_state_hash": "hex",
+  "timeout_seconds": 120,
+  "poll_interval_seconds": 5
+}
+```
+
+It returns `status: "verified"` when the verifier checkpoint reaches the
+expected sequence/hash, otherwise `status: "timeout"`. A timeout means the
+base-layer post may still exist, but this verifier has not observed and accepted
+it yet.
+
 `POST /verifier/ingest-event` accepts a normalized EON data-output event. It is
-the verifier/indexer boundary used before live block polling is wired in:
+the verifier/indexer boundary used by direct event ingestion and live UTXO sync:
 
 ```json
 {
@@ -438,13 +461,18 @@ Request:
 }
 ```
 
-`POST /devnet/submit-latest-batch` submits the latest operator batch through a
-configured submitter command and persists the returned transaction metadata on
-the batch record. The command is configured with `EON_DEVNET_SUBMIT_CMD`; it
-receives JSON on stdin with `api_url`, `sequence`, `payload_hex`, and
-`data_scalars`, then must return JSON containing at least `tx_hash`. The API
-decrypts the active semantic layer's bound base-layer account JSON and exposes
-it to the submitter as a temporary `EON_OPERATOR_WALLET_FILE` for that call.
+`POST /devnet/submit-latest-batch` submits the latest operator batch through the
+configured base-layer API or legacy submitter command and persists the returned
+transaction metadata on the batch record. By default it then triggers a bounded
+verifier sync: poll every `5` seconds for up to `120` seconds, ending early once
+the verifier checkpoint reaches the submitted batch sequence and state hash.
+Pass `wait_for_verifier: false` to return immediately after submission.
+
+The legacy command path is configured with `EON_DEVNET_SUBMIT_CMD`; it receives
+JSON on stdin with `api_url`, `sequence`, `payload_hex`, and `data_scalars`,
+then must return JSON containing at least `tx_hash`. The API decrypts the active
+semantic layer's bound base-layer account JSON and exposes it to the submitter
+as a temporary `EON_OPERATOR_WALLET_FILE` for that call.
 
 Example submitter response:
 

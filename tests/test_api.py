@@ -103,7 +103,7 @@ class ApiTests(unittest.TestCase):
         expected_key="base-secret",
         wallet_address="0x" + "9" * 64,
     ):
-        calls = {"transfers": []}
+        calls = {"transfers": [], "utxos": []}
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, format, *args):
@@ -138,6 +138,9 @@ class ApiTests(unittest.TestCase):
                         },
                     )
                     return
+                if self.path.startswith("/utxos"):
+                    self._send_json(200, calls["utxos"])
+                    return
                 self._send_json(404, {"error": "not found"})
 
             def do_POST(self):
@@ -150,6 +153,16 @@ class ApiTests(unittest.TestCase):
                 content_length = int(self.headers.get("content-length", "0"))
                 body = json.loads(self.rfile.read(content_length).decode("utf-8"))
                 calls["transfers"].append(body)
+                calls["utxos"].append(
+                    {
+                        "id": f"0xutxo{len(calls['utxos']) + 1}",
+                        "tx_hash": "0xbasehash",
+                        "output_index": len(calls["utxos"]),
+                        "amount": body["amount"],
+                        "owner": body["recipient"],
+                        "data": body["data"],
+                    }
+                )
                 self._send_json(
                     200,
                     {
@@ -1090,6 +1103,16 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(submission["owner"], base_account["eon_address"])
         self.assertEqual(submission["payload_hex"], batch["payload_hex"])
 
+        verification = response.json()["verification"]
+        self.assertTrue(verification["verified"])
+        self.assertEqual(verification["status"], "verified")
+        self.assertEqual(verification["checkpoint"]["sequence"], batch["sequence"])
+        self.assertEqual(verification["checkpoint"]["state_hash"], batch["new_state_hash"])
+
+        response = self.client.get(f"/verifier/state?sl_id={SL_ID.hex()}&version=0001")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["state"]["state_hash"], batch["new_state_hash"])
+
     def test_devnet_submission_can_use_base_layer_api_wallet_as_recipient(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")
@@ -1113,6 +1136,7 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/devnet/submit-latest-batch", json={})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(calls["transfers"][0]["recipient"], wallet_address)
+        self.assertEqual(response.json()["verification"]["status"], "verified")
 
     def test_devnet_submission_records_tx_metadata(self):
         self._init()

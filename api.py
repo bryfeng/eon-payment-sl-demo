@@ -6,8 +6,10 @@ logic with SQLite-backed runtime storage, so this is one shared demo world that
 can be hosted on a persistent Railway volume.
 """
 
+import os
 import sqlite3
 import re
+import time
 from threading import RLock
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -34,6 +36,7 @@ from payment_plugin import PAYMENT_PLUGIN, PaymentSLPlugin, payment_plugin_for
 from storage import DEFAULT_DB_PATH, SQLiteStorage
 from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore
 from verifier_engine.eon_data import ScalarFramingError, payload_bytes_to_scalar_hex
+from verifier_engine.sources import BaseLayerAPIEventSource
 
 
 STATE_LOCK = RLock()
@@ -157,6 +160,19 @@ class DevnetSubmitRequest(BaseModel):
     force: bool = False
     sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
     version: str = Field(default=core.VERSION.hex(), min_length=1)
+    wait_for_verifier: bool = True
+    verifier_timeout_seconds: int = Field(default=120, ge=0, le=300)
+    verifier_poll_interval_seconds: float = Field(default=5, gt=0, le=30)
+
+
+class VerifierSyncRequest(BaseModel):
+    sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
+    version: str = Field(default=core.VERSION.hex(), min_length=1)
+    posting_owner: Optional[str] = None
+    expected_sequence: Optional[int] = Field(default=None, ge=1)
+    expected_state_hash: Optional[str] = None
+    timeout_seconds: int = Field(default=0, ge=0, le=300)
+    poll_interval_seconds: float = Field(default=5, gt=0, le=30)
 
 
 class BaseEventRequest(BaseModel):
@@ -941,6 +957,122 @@ def _accept_envelope(
     if result["accepted"]:
         return True, "accepted"
     return False, result["message"]
+
+
+def _base_layer_api_url() -> Optional[str]:
+    for key in ("BASE_LAYER_API_URL", "EON_BASE_LAYER_API_URL"):
+        value = os.environ.get(key)
+        if value and value.strip():
+            return value.strip()
+    return None
+
+
+def _checkpoint_response(sl_id: str, version: str) -> Optional[dict]:
+    checkpoint = _verifier_store().load_checkpoint(
+        bytes.fromhex(sl_id),
+        bytes.fromhex(version),
+    )
+    if checkpoint is None:
+        return None
+    return {
+        "sequence": checkpoint["sequence"],
+        "state_hash": checkpoint["state_hash"],
+        "state": checkpoint["state"],
+    }
+
+
+def _checkpoint_matches(
+    checkpoint: Optional[dict],
+    expected_sequence: Optional[int],
+    expected_state_hash: Optional[str],
+) -> bool:
+    if checkpoint is None:
+        return False
+    if expected_sequence is not None and int(checkpoint["sequence"]) < expected_sequence:
+        return False
+    if expected_state_hash and checkpoint["state_hash"] != expected_state_hash:
+        return False
+    return True
+
+
+def _sync_verifier_from_base_layer_api(
+    sl_id: str,
+    version: str,
+    *,
+    posting_owner: Optional[str] = None,
+    expected_sequence: Optional[int] = None,
+    expected_state_hash: Optional[str] = None,
+    timeout_seconds: int = 0,
+    poll_interval_seconds: float = 5,
+) -> dict:
+    base_url = _base_layer_api_url()
+    if not base_url:
+        raise DevnetSubmitError("BASE_LAYER_API_URL is required for verifier sync")
+
+    started = time.monotonic()
+    deadline = started + max(0, timeout_seconds)
+    attempts: list[dict] = []
+    layer_source = f"base-layer-api:{sl_id}:{version}"
+    checkpoint = _checkpoint_response(sl_id, version)
+
+    while True:
+        try:
+            source = BaseLayerAPIEventSource(
+                base_url,
+                owner=posting_owner,
+                network_id="devnet",
+            )
+            sync_result = _verifier_engine().sync_from_source(source, layer_source)
+        except Exception as e:
+            sync_result = {"error": str(e), "events": []}
+
+        checkpoint = _checkpoint_response(sl_id, version)
+        advanced = _checkpoint_matches(
+            checkpoint,
+            expected_sequence,
+            expected_state_hash,
+        )
+        accepted_events = [
+            event for event in sync_result.get("events", [])
+            if event.get("accepted")
+        ]
+        attempts.append({
+            "accepted": len(accepted_events),
+            "event_count": len(sync_result.get("events", [])),
+            "error": sync_result.get("error"),
+            "checkpoint_sequence": (
+                checkpoint["sequence"] if checkpoint is not None else None
+            ),
+            "checkpoint_state_hash": (
+                checkpoint["state_hash"] if checkpoint is not None else None
+            ),
+        })
+
+        if advanced:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(min(poll_interval_seconds, max(0, deadline - time.monotonic())))
+
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    status = "verified" if _checkpoint_matches(
+        checkpoint,
+        expected_sequence,
+        expected_state_hash,
+    ) else "timeout"
+    return {
+        "status": status,
+        "verified": status == "verified",
+        "source": layer_source,
+        "posting_owner": posting_owner,
+        "expected_sequence": expected_sequence,
+        "expected_state_hash": expected_state_hash,
+        "checkpoint": checkpoint,
+        "attempts": attempts,
+        "elapsed_ms": elapsed_ms,
+        "timeout_seconds": timeout_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+    }
 
 
 @app.get("/health")
@@ -1774,10 +1906,38 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
 
+    verification = None
+    if request.wait_for_verifier and _base_layer_api_url():
+        verification = _sync_verifier_from_base_layer_api(
+            sl_id,
+            version,
+            posting_owner=submission.get("owner"),
+            expected_sequence=int(updated_batch["sequence"]),
+            expected_state_hash=str(updated_batch["new_state_hash"]),
+            timeout_seconds=request.verifier_timeout_seconds,
+            poll_interval_seconds=request.verifier_poll_interval_seconds,
+        )
+        try:
+            updated_batch = STORE.record_batch_verification(
+                int(updated_batch["sequence"]),
+                verification,
+                sl_id,
+                version,
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+    elif request.wait_for_verifier:
+        verification = {
+            "status": "skipped",
+            "verified": False,
+            "message": "BASE_LAYER_API_URL is not configured for verifier sync",
+        }
+
     return {
         "submitted": True,
         "sequence": submission["sequence"],
         "devnet_submission": submission,
+        "verification": verification,
         "batch": updated_batch,
         "sl_id": sl_id,
         "version": version,
@@ -1830,6 +1990,23 @@ def verifier_ingest_event(event: BaseEventRequest) -> dict:
         if not result.get("accepted") and not result.get("ignored"):
             raise HTTPException(status_code=400, detail=result["message"])
         return result
+
+
+@app.post("/verifier/sync")
+def verifier_sync(request: VerifierSyncRequest) -> dict:
+    sl_id, version = _layer_hex(request.sl_id, request.version)
+    try:
+        return _sync_verifier_from_base_layer_api(
+            sl_id,
+            version,
+            posting_owner=request.posting_owner,
+            expected_sequence=request.expected_sequence,
+            expected_state_hash=request.expected_state_hash,
+            timeout_seconds=request.timeout_seconds,
+            poll_interval_seconds=request.poll_interval_seconds,
+        )
+    except DevnetSubmitError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
 
 
 @app.post("/verifier/accept-latest-batch")

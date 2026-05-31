@@ -286,6 +286,52 @@ class SQLiteStorage:
                 )
         return record
 
+    def _record_batch_verification(
+        self,
+        conn: sqlite3.Connection,
+        sequence: int,
+        verification: dict,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> dict:
+        row = conn.execute(
+            """
+            SELECT record_json FROM sl_operator_batches
+            WHERE sl_id = ? AND version = ? AND sequence = ?
+            """,
+            (sl_id, version, sequence),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"batch {sequence} not found")
+
+        record = _loads(row["record_json"])
+        record["verification"] = verification
+        conn.execute(
+            """
+            UPDATE sl_operator_batches
+            SET record_json = ?
+            WHERE sl_id = ? AND version = ? AND sequence = ?
+            """,
+            (_dumps(record), sl_id, version, sequence),
+        )
+        if sl_id == core.SL_ID.hex() and version == core.VERSION.hex():
+            legacy_row = conn.execute(
+                "SELECT record_json FROM operator_batches WHERE sequence = ?",
+                (sequence,),
+            ).fetchone()
+            if legacy_row is not None:
+                legacy_record = _loads(legacy_row["record_json"])
+                legacy_record["verification"] = verification
+                conn.execute(
+                    """
+                    UPDATE operator_batches
+                    SET record_json = ?
+                    WHERE sequence = ?
+                    """,
+                    (_dumps(legacy_record), sequence),
+                )
+        return record
+
     def _put_json(self, conn: sqlite3.Connection, key: str, value: Any) -> None:
         conn.execute(
             """
@@ -1428,6 +1474,16 @@ class SQLiteStorage:
     ) -> dict:
         with self.connect() as conn:
             return self._record_devnet_submission(conn, sequence, submission, sl_id, version)
+
+    def record_batch_verification(
+        self,
+        sequence: int,
+        verification: dict,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> dict:
+        with self.connect() as conn:
+            return self._record_batch_verification(conn, sequence, verification, sl_id, version)
 
     def load_verified_log(self) -> list:
         with self.connect() as conn:
