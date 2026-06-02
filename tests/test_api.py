@@ -298,6 +298,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["sequence"], 2)
         self.assertEqual(response.json()["accepted_sequences"], [1, 2])
 
+        batches = self.client.get("/operator/batches")
+        self.assertEqual(batches.status_code, 200, batches.text)
+        self.assertEqual(batches.json()["batches"][0]["verification_source"], "local_replay")
+        self.assertEqual(batches.json()["batches"][0]["effective_status"], "verified")
+        self.assertFalse(batches.json()["batches"][0]["devnet_backed"])
+
         alice_balance = self.client.get(f"/balances/{alice['address']}").json()
         bob_balance = self.client.get(f"/balances/{bob['address']}").json()
         self.assertEqual(alice_balance["balance"], 60)
@@ -1037,6 +1043,12 @@ class ApiTests(unittest.TestCase):
         response = self.client.get("/operator/batches")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["batches"][0]["status"], "verified")
+        self.assertEqual(response.json()["batches"][0]["verification_source"], "devnet_utxo")
+        self.assertEqual(response.json()["batches"][0]["verification_label"], "Devnet UTXO")
+        self.assertEqual(response.json()["batches"][0]["event_key"], "devnet:utxo:0xutxo1:0")
+        self.assertEqual(response.json()["batches"][0]["utxo_id"], "0xutxo1")
+        self.assertEqual(response.json()["batches"][0]["verification_tx_hash"], "0xtx1")
+        self.assertTrue(response.json()["batches"][0]["devnet_backed"])
 
     def test_devnet_submission_requires_configured_submitter(self):
         self._init()

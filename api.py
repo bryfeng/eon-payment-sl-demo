@@ -1010,6 +1010,93 @@ def _checkpoint_matches(
     return True
 
 
+def _event_evidence(entry: Optional[dict], batch: Optional[dict] = None) -> dict:
+    entry = entry or {}
+    submission = (batch or {}).get("devnet_submission") or {}
+    event_key = str(entry.get("event_key") or entry.get("cursor") or "")
+    parts = event_key.split(":")
+    parsed_tx_hash = ""
+    parsed_output_index = ""
+    if len(parts) >= 4 and parts[0] == "devnet":
+        if parts[1] == "utxo":
+            parsed_tx_hash = parts[2]
+            parsed_output_index = parts[3]
+        else:
+            parsed_tx_hash = parts[2]
+            parsed_output_index = parts[3]
+
+    tx_hash = str(entry.get("tx_hash") or parsed_tx_hash or "")
+    output_index = entry.get("output_index", parsed_output_index)
+    output_index_text = "" if output_index is None else str(output_index)
+    utxo_id = str(entry.get("utxo_id") or parsed_tx_hash or "")
+    submission_tx_hash = str(submission.get("tx_hash") or "")
+    source = "devnet_utxo" if event_key or tx_hash or utxo_id else "local_replay"
+
+    return {
+        "verification_source": source,
+        "verification_label": "Devnet UTXO" if source == "devnet_utxo" else "Local replay",
+        "event_key": event_key or None,
+        "utxo_id": utxo_id or None,
+        "verification_tx_hash": tx_hash or None,
+        "verification_output_index": output_index_text or None,
+        "submission_tx_hash": submission_tx_hash or None,
+        "submission_output_index": submission.get("output_index"),
+        "submission_amount": submission.get("amount"),
+        "devnet_backed": source == "devnet_utxo",
+        "verified_at": entry.get("created_at"),
+    }
+
+
+def _accepted_log_by_sequence(sl_id: str, version: str) -> dict[int, dict]:
+    entries = _verifier_store().list_verification_log(
+        bytes.fromhex(sl_id),
+        bytes.fromhex(version),
+    )
+    accepted: dict[int, dict] = {}
+    for entry in entries:
+        sequence = entry.get("sequence")
+        if entry.get("verdict") == "accepted" and sequence is not None:
+            accepted[int(sequence)] = entry
+    return accepted
+
+
+def _batch_with_evidence(batch: dict, accepted_log: Optional[dict[int, dict]] = None) -> dict:
+    record = {**batch}
+    sequence = int(record["sequence"])
+    entry = (accepted_log or {}).get(sequence)
+    verified = bool(
+        entry
+        and entry.get("new_state_hash") == record.get("new_state_hash")
+        and entry.get("prev_state_hash") == record.get("prev_state_hash")
+    )
+    record["verified"] = verified
+    record["effective_status"] = "verified" if verified else record.get("status", "batched")
+    if verified:
+        record.update(_event_evidence(entry, record))
+    else:
+        record.update(
+            {
+                "verification_source": None,
+                "verification_label": "Not verified",
+                "event_key": None,
+                "utxo_id": (record.get("devnet_submission") or {}).get("utxo_id"),
+                "verification_tx_hash": None,
+                "verification_output_index": None,
+                "submission_tx_hash": (record.get("devnet_submission") or {}).get("tx_hash"),
+                "submission_output_index": (record.get("devnet_submission") or {}).get("output_index"),
+                "submission_amount": (record.get("devnet_submission") or {}).get("amount"),
+                "devnet_backed": False,
+                "verified_at": None,
+            }
+        )
+    return record
+
+
+def _batches_with_evidence(batches: list[dict], sl_id: str, version: str) -> list[dict]:
+    accepted_log = _accepted_log_by_sequence(sl_id, version)
+    return [_batch_with_evidence(batch, accepted_log) for batch in batches]
+
+
 def _sync_verifier_from_base_layer_api(
     sl_id: str,
     version: str,
@@ -1510,7 +1597,8 @@ def semantic_layer_workbench_state(
         verifier_state = None
 
     pending_actions = STORE.load_pending(layer_sl_id, layer_version) if runtime_config else []
-    batches = STORE.list_batches(layer_sl_id, layer_version) if runtime_config else []
+    raw_batches = STORE.list_batches(layer_sl_id, layer_version) if runtime_config else []
+    batches = _batches_with_evidence(raw_batches, layer_sl_id, layer_version) if runtime_config else []
     latest_batch = batches[-1] if batches else None
     verifier_log = _verifier_store().list_verification_log(
         verifier_sl_id_bytes,
@@ -1847,7 +1935,7 @@ def operator_batches(
     layer_sl_id, layer_version = _layer_hex(sl_id, version)
     _require_initialized(layer_sl_id, layer_version)
     return {
-        "batches": STORE.list_batches(layer_sl_id, layer_version),
+        "batches": _batches_with_evidence(STORE.list_batches(layer_sl_id, layer_version), layer_sl_id, layer_version),
         "sl_id": layer_sl_id,
         "version": layer_version,
     }
@@ -1981,7 +2069,7 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
         "sequence": submission["sequence"],
         "devnet_submission": submission,
         "verification": verification,
-        "batch": updated_batch,
+        "batch": _batch_with_evidence(updated_batch, _accepted_log_by_sequence(sl_id, version)),
         "sl_id": sl_id,
         "version": version,
     }
@@ -2050,7 +2138,10 @@ def verifier_sync(request: VerifierSyncRequest) -> dict:
         )
         updated_batch = _record_verification_for_checkpoint_batch(sl_id, version, result)
         if updated_batch is not None:
-            result["batch"] = updated_batch
+            result["batch"] = _batch_with_evidence(
+                updated_batch,
+                _accepted_log_by_sequence(sl_id, version),
+            )
         return result
     except DevnetSubmitError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e

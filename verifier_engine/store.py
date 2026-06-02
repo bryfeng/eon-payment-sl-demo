@@ -236,27 +236,70 @@ class VerifierStore:
         with self.connect() as conn:
             if sl_id is None:
                 rows = conn.execute(
-                    "SELECT entry_json FROM verification_log ORDER BY id"
+                    """
+                    SELECT
+                      verification_log.entry_json,
+                      verification_log.created_at,
+                      base_events.tx_hash AS event_tx_hash,
+                      base_events.output_index AS event_output_index,
+                      base_events.utxo_id AS event_utxo_id,
+                      base_events.amount AS event_amount
+                    FROM verification_log
+                    LEFT JOIN base_events
+                      ON base_events.event_key = verification_log.event_key
+                    ORDER BY verification_log.id
+                    """
                 ).fetchall()
             elif version is None:
                 rows = conn.execute(
                     """
-                    SELECT entry_json FROM verification_log
-                    WHERE sl_id = ?
-                    ORDER BY sequence
+                    SELECT
+                      verification_log.entry_json,
+                      verification_log.created_at,
+                      base_events.tx_hash AS event_tx_hash,
+                      base_events.output_index AS event_output_index,
+                      base_events.utxo_id AS event_utxo_id,
+                      base_events.amount AS event_amount
+                    FROM verification_log
+                    LEFT JOIN base_events
+                      ON base_events.event_key = verification_log.event_key
+                    WHERE verification_log.sl_id = ?
+                    ORDER BY verification_log.sequence
                     """,
                     (sl_id.hex(),),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     """
-                    SELECT entry_json FROM verification_log
-                    WHERE sl_id = ? AND version = ?
-                    ORDER BY sequence
+                    SELECT
+                      verification_log.entry_json,
+                      verification_log.created_at,
+                      base_events.tx_hash AS event_tx_hash,
+                      base_events.output_index AS event_output_index,
+                      base_events.utxo_id AS event_utxo_id,
+                      base_events.amount AS event_amount
+                    FROM verification_log
+                    LEFT JOIN base_events
+                      ON base_events.event_key = verification_log.event_key
+                    WHERE verification_log.sl_id = ? AND verification_log.version = ?
+                    ORDER BY verification_log.sequence
                     """,
                     (sl_id.hex(), version.hex()),
                 ).fetchall()
-        return [_loads(row["entry_json"]) for row in rows]
+        entries = []
+        for row in rows:
+            entry = _loads(row["entry_json"])
+            entry.setdefault("created_at", row["created_at"])
+            if row["event_tx_hash"] is not None:
+                entry.setdefault("tx_hash", row["event_tx_hash"])
+            if row["event_output_index"] is not None:
+                entry.setdefault("output_index", row["event_output_index"])
+            if row["event_utxo_id"] is not None:
+                entry.setdefault("utxo_id", row["event_utxo_id"])
+            if row["event_amount"] is not None:
+                entry.setdefault("amount", row["event_amount"])
+            entries.append(entry)
+        return entries
 
     def commit_verification(
         self,
