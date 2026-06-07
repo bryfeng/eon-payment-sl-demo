@@ -16,6 +16,12 @@ class VerifierEngine:
         self.registry = registry
         self.plugin_config = plugin_config or {}
 
+    def _checkpoint_state_hash(self, plugin, checkpoint: dict) -> str:
+        try:
+            return plugin.state_hash(plugin.state_from_dict(checkpoint["state"]))
+        except Exception:
+            return checkpoint["state_hash"]
+
     def ingest_event(self, event: dict) -> dict:
         event_key, exists = self.store.has_base_event(event)
         if exists:
@@ -158,7 +164,10 @@ class VerifierEngine:
                 "accepted": False,
                 "message": f"sequence mismatch: expected {expected_sequence}, got {result.sequence}",
             }
-        if checkpoint is not None and checkpoint["state_hash"] != result.prev_state_hash:
+        if (
+            checkpoint is not None
+            and self._checkpoint_state_hash(plugin, checkpoint) != result.prev_state_hash
+        ):
             return {
                 "accepted": False,
                 "message": "prev_state_hash does not match current verifier state",

@@ -796,6 +796,40 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["balance"], 100)
 
+        bob = self._wallet("Bob", "bob_vk")
+        response = self.client.post(
+            "/actions/transfer",
+            json={
+                "from_address": alice["address"],
+                "to_address": bob["address"],
+                "amount": 40,
+                "asset_id": "BSTK",
+                "vk": "alice_vk",
+                "sl_id": sl_id,
+                "version": version,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(f"/operator/batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["sequence"], 2)
+
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get(
+            f"/balances/{alice['address']}?source=verifier&sl_id={sl_id}&version={version}&asset_id=BSTK"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["balance"], 60)
+
+        response = self.client.get(
+            f"/balances/{bob['address']}?source=verifier&sl_id={sl_id}&version={version}&asset_id=BSTK"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["balance"], 40)
+
     def test_semantic_layer_record_hydrates_existing_runtime_metadata(self):
         self._init()
         operator = self._operator_wallet()

@@ -989,9 +989,11 @@ def _checkpoint_response(sl_id: str, version: str) -> Optional[dict]:
     )
     if checkpoint is None:
         return None
+    plugin = _payment_plugin(sl_id, version)
+    state = plugin.state_from_dict(checkpoint["state"])
     return {
         "sequence": checkpoint["sequence"],
-        "state_hash": checkpoint["state_hash"],
+        "state_hash": plugin.state_hash(state),
         "state": checkpoint["state"],
     }
 

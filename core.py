@@ -233,7 +233,7 @@ class State:
                 asset_id: sorted(list(addresses))
                 for asset_id, addresses in sorted(self.frozen_by_asset.items())
             }
-        canonical = json.dumps(canonical_state, separators=(",", ":"))
+        canonical = json.dumps(canonical_state, separators=(",", ":"), sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
 
     def clone(self) -> "State":

@@ -1,3 +1,4 @@
+import json
 import sys
 import tempfile
 import unittest
@@ -130,6 +131,33 @@ class PaymentSLTests(unittest.TestCase):
         self.assertEqual(next_state.get_balance(bob, "BSTK"), 40)
         self.assertEqual(next_state.get_total_supply("BSTK"), 100)
         self.assertEqual(next_state.total_supply, 0)
+
+    def test_custom_asset_hash_survives_sorted_json_round_trip(self):
+        issuer = "issuer_vk"
+        alice = hash_vk("alice_vk")
+        state = State(issuer_vk=issuer)
+        actions = [
+            Action(
+                ActionType.REGISTER_ASSET,
+                issuer,
+                1,
+                asset_id="BSTK",
+                symbol="BSTK",
+                asset_name="bStocks",
+                decimals=0,
+                asset_type="equity",
+                metadata={},
+            ),
+            Action(ActionType.MINT, issuer, 2, asset_id="BSTK", to=alice, amount=100),
+        ]
+
+        next_state, _result = process_batch(state, actions)
+        persisted = json.loads(
+            json.dumps(next_state.to_dict(), separators=(",", ":"), sort_keys=True)
+        )
+        rehydrated = State.from_dict(persisted)
+
+        self.assertEqual(rehydrated.state_hash(), next_state.state_hash())
 
     def test_devnet_scalar_framing_round_trip(self):
         envelope = self._valid_envelope()
