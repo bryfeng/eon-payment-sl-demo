@@ -1204,6 +1204,78 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["state"]["state_hash"], batch["new_state_hash"])
 
+    def test_devnet_submission_verifies_manifest_asset_genesis(self):
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+        sl_id = "00010002"
+        version = VERSION.hex()
+        asset = {
+            "asset_id": "SPX",
+            "symbol": "SPX",
+            "name": "SP500",
+            "decimals": 5,
+            "asset_type": "fungible",
+        }
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "RWA-issuer",
+                "sl_id": sl_id,
+                "version": version,
+                "operator_wallet_address": operator["address"],
+                "base_layer_account_id": base_account["id"],
+                "assets": [asset],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(
+            "/operator/init",
+            json={
+                "issuer_vk": "issuer_vk",
+                "sl_id": sl_id,
+                "version": version,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        alice = self._wallet("Alice", "alice_vk")
+        response = self.client.post(
+            "/actions/mint",
+            json={
+                "to_address": alice["address"],
+                "amount": 100,
+                "asset_id": "SPX",
+                "sl_id": sl_id,
+                "version": version,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(f"/operator/batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        batch = response.json()["batch"]
+        self.assertEqual(batch["applied"], 1)
+
+        base_url, _calls = self._mock_base_layer_api()
+        os.environ.pop("EON_DEVNET_SUBMIT_CMD", None)
+        os.environ["BASE_LAYER_API_URL"] = base_url
+        os.environ["BASE_LAYER_API_KEY"] = "base-secret"
+
+        response = self.client.post(
+            "/devnet/submit-latest-batch",
+            json={"sl_id": sl_id, "version": version},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["status"], "verified")
+        self.assertTrue(response.json()["verification"]["verified"])
+
+        response = self.client.get(f"/verifier/state?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        state = response.json()["state"]
+        self.assertEqual(state["state_hash"], batch["new_state_hash"])
+        self.assertEqual(state["total_supply_by_asset"]["SPX"], 100)
+
     def test_devnet_submission_can_target_historical_batch(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")

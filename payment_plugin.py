@@ -24,7 +24,10 @@ class PaymentSLPlugin:
         issuer_vk = config.get("issuer_vk")
         if not issuer_vk:
             raise ValueError("Payment SL plugin requires issuer_vk for genesis state")
-        return State(issuer_vk=issuer_vk)
+        state = State(issuer_vk=issuer_vk)
+        for asset in config.get("assets", []):
+            state.register_asset(asset)
+        return state
 
     def state_hash(self, state: State) -> str:
         return state.state_hash()

@@ -182,6 +182,32 @@ class VerifierStore:
             ).fetchone()
         return event_key, row is not None
 
+    def has_accepted_verification(self, event_key: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM verification_log
+                WHERE event_key = ? AND verdict = 'accepted'
+                LIMIT 1
+                """,
+                (event_key,),
+            ).fetchone()
+        return row is not None
+
+    def has_rejected_verification(self, event_key: str) -> bool:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM verification_log
+                WHERE event_key = ? AND verdict = 'rejected'
+                LIMIT 1
+                """,
+                (event_key,),
+            ).fetchone()
+        return row is not None
+
     def list_base_events(
         self,
         after: Optional[str] = None,

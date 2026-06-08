@@ -558,7 +558,18 @@ def _verifier_engine() -> VerifierEngine:
         version_hex = str(runtime["version"])
         plugin = _payment_plugin(sl_id_hex, version_hex)
         plugins_by_key[(sl_id_hex, version_hex)] = plugin
-        config[sl_id_hex] = {"issuer_vk": runtime["issuer_vk"]}
+        record = STORE.get_semantic_layer(sl_id_hex)
+        assets = (
+            list(record.get("assets", []))
+            if record and record.get("version") == version_hex
+            else []
+        )
+        plugin_config = {
+            "issuer_vk": runtime["issuer_vk"],
+            "assets": assets,
+        }
+        config[f"{sl_id_hex}:{version_hex}"] = plugin_config
+        config[sl_id_hex] = plugin_config
     return VerifierEngine(
         store=_verifier_store(),
         registry=PluginRegistry(list(plugins_by_key.values())),
@@ -1126,7 +1137,11 @@ def _sync_verifier_from_base_layer_api(
                 owner=posting_owner,
                 network_id="devnet",
             )
-            sync_result = _verifier_engine().sync_from_source(source, layer_source)
+            sync_result = _verifier_engine().sync_from_source(
+                source,
+                layer_source,
+                retry_rejected=bool(expected_sequence or expected_state_hash),
+            )
         except Exception as e:
             sync_result = {"error": str(e), "events": []}
 

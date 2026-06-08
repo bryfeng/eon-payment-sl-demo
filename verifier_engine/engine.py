@@ -22,23 +22,43 @@ class VerifierEngine:
         except Exception:
             return checkpoint["state_hash"]
 
-    def ingest_event(self, event: dict) -> dict:
+    def _plugin_config(self, sl_id: bytes, version: bytes) -> dict:
+        return (
+            self.plugin_config.get(f"{sl_id.hex()}:{version.hex()}")
+            or self.plugin_config.get(sl_id.hex())
+            or {}
+        )
+
+    def ingest_event(self, event: dict, *, retry_rejected: bool = False) -> dict:
         event_key, exists = self.store.has_base_event(event)
         if exists:
-            return {
-                "stored": True,
-                "duplicate": True,
-                "event_key": event_key,
-                "accepted": False,
-                "ignored": True,
-                "message": "base event already ingested",
-            }
+            if (
+                retry_rejected
+                and self.store.has_rejected_verification(event_key)
+                and not self.store.has_accepted_verification(event_key)
+            ):
+                exists = True
+            else:
+                return {
+                    "stored": True,
+                    "duplicate": True,
+                    "event_key": event_key,
+                    "accepted": False,
+                    "ignored": True,
+                    "message": "base event already ingested",
+                }
+
+        if exists:
+            inserted = False
+        else:
+            inserted = True
 
         try:
             payload = scalar_hex_to_payload_bytes(event.get("data_scalars", []))
             sl_id, version = payload_header(payload)
         except Exception as e:
-            event_key, _inserted = self.store.append_base_event(event)
+            if not exists:
+                event_key, _inserted = self.store.append_base_event(event)
             return {
                 "stored": True,
                 "duplicate": False,
@@ -50,7 +70,8 @@ class VerifierEngine:
 
         plugin = self.registry.get(sl_id, version)
         if plugin is None:
-            event_key, _inserted = self.store.append_base_event(event)
+            if not exists:
+                event_key, _inserted = self.store.append_base_event(event)
             return {
                 "stored": True,
                 "duplicate": False,
@@ -65,7 +86,8 @@ class VerifierEngine:
         try:
             transition = plugin.parse_payload(payload)
         except Exception as e:
-            event_key, _inserted = self.store.append_base_event(event)
+            if not exists:
+                event_key, _inserted = self.store.append_base_event(event)
             return {
                 "stored": True,
                 "duplicate": False,
@@ -107,8 +129,9 @@ class VerifierEngine:
                 "message": f"sequence {sequence} is already behind checkpoint {checkpoint['sequence']}",
             }
 
-        event_key, inserted = self.store.append_base_event(event)
-        if not inserted:
+        if not exists:
+            event_key, inserted = self.store.append_base_event(event)
+        if not inserted and not retry_rejected:
             return {
                 "stored": True,
                 "duplicate": True,
@@ -119,7 +142,7 @@ class VerifierEngine:
             }
 
         if checkpoint is None:
-            prev_state = plugin.genesis_state(self.plugin_config.get(sl_id.hex(), {}))
+            prev_state = plugin.genesis_state(self._plugin_config(sl_id, version))
         else:
             prev_state = plugin.state_from_dict(checkpoint["state"])
 
@@ -189,12 +212,18 @@ class VerifierEngine:
             "state_hash": state_hash,
         }
 
-    def sync_from_source(self, source, source_name: str = "default") -> dict:
+    def sync_from_source(
+        self,
+        source,
+        source_name: str = "default",
+        *,
+        retry_rejected: bool = False,
+    ) -> dict:
         cursor = self.store.load_cursor(source_name)
         ingested = []
         latest_cursor = cursor
         for event in source.events_after(cursor):
-            ingested.append(self.ingest_event(event))
+            ingested.append(self.ingest_event(event, retry_rejected=retry_rejected))
             latest_cursor = str(event.get("cursor", latest_cursor or ""))
         if latest_cursor is not None:
             self.store.save_cursor(source_name, latest_cursor)
