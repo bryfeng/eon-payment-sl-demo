@@ -66,6 +66,11 @@ class ActionType(Enum):
     MINT = "mint"
     BURN = "burn"
     TRANSFER = "transfer"
+    BUNDLE_TRANSFER = "bundle_transfer"
+    POOL_DEPOSIT = "pool_deposit"
+    POOL_WITHDRAW = "pool_withdraw"
+    POOL_SWAP_IN = "pool_swap_in"
+    POOL_SWAP_OUT = "pool_swap_out"
     FREEZE = "freeze"
     UNFREEZE = "unfreeze"
 
@@ -88,6 +93,12 @@ class Action:
     from_addr: Optional[str] = None
     amount: Optional[int] = None
     target: Optional[str] = None      # for freeze/unfreeze
+    bundle_id: Optional[str] = None
+    leg_id: Optional[str] = None
+    pool_id: Optional[str] = None
+    owner: Optional[str] = None
+    trader: Optional[str] = None
+    reservation_id: Optional[str] = None
 
     def serialize(self) -> bytes:
         """Compact serialization for the demo payload."""
@@ -116,6 +127,18 @@ class Action:
             payload["amount"] = self.amount
         if self.target is not None:
             payload["target"] = self.target
+        if self.bundle_id is not None:
+            payload["bundle_id"] = self.bundle_id
+        if self.leg_id is not None:
+            payload["leg_id"] = self.leg_id
+        if self.pool_id is not None:
+            payload["pool_id"] = self.pool_id
+        if self.owner is not None:
+            payload["owner"] = self.owner
+        if self.trader is not None:
+            payload["trader"] = self.trader
+        if self.reservation_id is not None:
+            payload["reservation_id"] = self.reservation_id
         return json.dumps(payload, separators=(",", ":")).encode()
 
     def to_dict(self) -> dict:
@@ -145,6 +168,18 @@ class Action:
             d["amount"] = self.amount
         if self.target is not None:
             d["target"] = self.target
+        if self.bundle_id is not None:
+            d["bundle_id"] = self.bundle_id
+        if self.leg_id is not None:
+            d["leg_id"] = self.leg_id
+        if self.pool_id is not None:
+            d["pool_id"] = self.pool_id
+        if self.owner is not None:
+            d["owner"] = self.owner
+        if self.trader is not None:
+            d["trader"] = self.trader
+        if self.reservation_id is not None:
+            d["reservation_id"] = self.reservation_id
         return d
 
     @classmethod
@@ -163,6 +198,12 @@ class Action:
             from_addr=d.get("from_addr", d.get("from")),
             amount=d.get("amount"),
             target=d.get("target"),
+            bundle_id=d.get("bundle_id"),
+            leg_id=d.get("leg_id"),
+            pool_id=d.get("pool_id"),
+            owner=d.get("owner"),
+            trader=d.get("trader"),
+            reservation_id=d.get("reservation_id"),
         )
 
 
@@ -181,6 +222,7 @@ class State:
     balances_by_asset: dict = field(default_factory=dict)  # asset_id -> address -> u64
     total_supply_by_asset: dict = field(default_factory=dict)  # asset_id -> u64
     frozen_by_asset: dict = field(default_factory=dict)  # asset_id -> set(addresses)
+    pool_escrow: dict = field(default_factory=dict)  # pool_id -> asset_id -> u64
 
     def __post_init__(self) -> None:
         self.total_supply = int(self.total_supply)
@@ -203,6 +245,13 @@ class State:
         self.frozen_by_asset = {
             str(asset_id): set(addresses)
             for asset_id, addresses in self.frozen_by_asset.items()
+        }
+        self.pool_escrow = {
+            str(pool_id): {
+                str(asset_id): int(amount)
+                for asset_id, amount in balances.items()
+            }
+            for pool_id, balances in self.pool_escrow.items()
         }
 
     def state_hash(self) -> str:
@@ -233,6 +282,11 @@ class State:
                 asset_id: sorted(list(addresses))
                 for asset_id, addresses in sorted(self.frozen_by_asset.items())
             }
+        if self.pool_escrow:
+            canonical_state["pool_escrow"] = {
+                pool_id: dict(sorted(balances.items()))
+                for pool_id, balances in sorted(self.pool_escrow.items())
+            }
         canonical = json.dumps(canonical_state, separators=(",", ":"), sort_keys=True)
         return hashlib.sha256(canonical.encode()).hexdigest()
 
@@ -252,6 +306,10 @@ class State:
             frozen_by_asset={
                 asset_id: set(addresses)
                 for asset_id, addresses in self.frozen_by_asset.items()
+            },
+            pool_escrow={
+                pool_id: dict(balances)
+                for pool_id, balances in self.pool_escrow.items()
             },
         )
 
@@ -321,6 +379,23 @@ class State:
             return
         self.frozen_by_asset.setdefault(key, set()).discard(addr)
 
+    def get_pool_escrow(self, pool_id: str, asset_id: Optional[str] = None) -> int:
+        key = asset_id or DEFAULT_ASSET_ID
+        return self.pool_escrow.get(pool_id, {}).get(key, 0)
+
+    def credit_pool_escrow(self, pool_id: str, amount: int, asset_id: Optional[str] = None) -> None:
+        key = asset_id or DEFAULT_ASSET_ID
+        self.pool_escrow.setdefault(pool_id, {})
+        self.pool_escrow[pool_id][key] = self.get_pool_escrow(pool_id, key) + int(amount)
+
+    def debit_pool_escrow(self, pool_id: str, amount: int, asset_id: Optional[str] = None) -> None:
+        key = asset_id or DEFAULT_ASSET_ID
+        current = self.get_pool_escrow(pool_id, key)
+        if current < amount:
+            raise TransitionError(f"Insufficient pool escrow: {current} < {amount}")
+        self.pool_escrow.setdefault(pool_id, {})
+        self.pool_escrow[pool_id][key] = current - int(amount)
+
     def to_dict(self) -> dict:
         data = {
             "issuer_vk": self.issuer_vk,
@@ -346,6 +421,11 @@ class State:
                 asset_id: sorted(list(addresses))
                 for asset_id, addresses in sorted(self.frozen_by_asset.items())
             }
+        if self.pool_escrow:
+            data["pool_escrow"] = {
+                pool_id: dict(sorted(balances.items()))
+                for pool_id, balances in sorted(self.pool_escrow.items())
+            }
         data["state_hash"] = self.state_hash()
         return data
 
@@ -365,6 +445,7 @@ class State:
                 asset_id: set(addresses)
                 for asset_id, addresses in frozen_by_asset.items()
             },
+            pool_escrow=dict(d.get("pool_escrow", {})),
         )
 
 
@@ -382,7 +463,94 @@ class PayloadDecodeError(Exception):
     pass
 
 
-def apply_action(state: State, action: Action) -> State:
+SL_ID = b"\x00\x01\x00\x01"   # 4 bytes — unique SL identifier
+VERSION = b"\x00\x01"          # 2 bytes — state machine version 0.1
+
+
+def _pool_action_kind(action_type: ActionType) -> str:
+    if action_type == ActionType.POOL_DEPOSIT:
+        return "deposit"
+    if action_type == ActionType.POOL_WITHDRAW:
+        return "withdraw"
+    if action_type == ActionType.POOL_SWAP_IN:
+        return "swap_in"
+    if action_type == ActionType.POOL_SWAP_OUT:
+        return "swap_out"
+    raise TransitionError(f"Unknown pool action type: {action_type}")
+
+
+def _pool_action_address(action: Action) -> str:
+    if action.action_type in {ActionType.POOL_DEPOSIT, ActionType.POOL_WITHDRAW}:
+        if not action.owner:
+            raise TransitionError("Pool action requires 'owner'")
+        return action.owner
+    if not action.trader:
+        raise TransitionError("Pool swap action requires 'trader'")
+    return action.trader
+
+
+def _context_amm_movements(context: Any, pool_id: str) -> list[dict[str, Any]]:
+    transitions = getattr(context, "child_transitions", None) or []
+    movements: list[dict[str, Any]] = []
+    for transition in transitions:
+        for raw_action in transition.get("actions", []):
+            for movement in raw_action.get("asset_movements", []) or []:
+                if str(movement.get("pool_id")) != pool_id:
+                    continue
+                movements.append({
+                    "kind": str(movement["kind"]),
+                    "leg_id": str(movement["leg_id"]),
+                    "pool_id": str(movement["pool_id"]),
+                    "sl_id": str(movement["sl_id"]).lower().removeprefix("0x"),
+                    "version": str(movement.get("version", VERSION.hex())).lower().removeprefix("0x"),
+                    "asset_id": str(movement["asset_id"]),
+                    "address": str(movement["address"]),
+                    "amount": int(movement["amount"]),
+                })
+    return movements
+
+
+def _require_matching_amm_movement(
+    action: Action,
+    *,
+    context: Any,
+    sl_id: bytes,
+    version: bytes,
+) -> None:
+    if context is None:
+        raise TransitionError("Pool escrow action requires bundle context")
+    bundle_id = getattr(context, "bundle_id", None)
+    if not bundle_id or str(action.bundle_id) != str(bundle_id):
+        raise TransitionError("bundle_id does not match bundle context")
+    if not action.leg_id:
+        raise TransitionError("Pool escrow action requires 'leg_id'")
+    if not action.pool_id:
+        raise TransitionError("Pool escrow action requires 'pool_id'")
+
+    expected = {
+        "kind": _pool_action_kind(action.action_type),
+        "leg_id": str(action.leg_id),
+        "pool_id": str(action.pool_id),
+        "sl_id": sl_id.hex(),
+        "version": version.hex(),
+        "asset_id": str(action.asset_id or DEFAULT_ASSET_ID),
+        "address": _pool_action_address(action),
+        "amount": int(action.amount or 0),
+    }
+    for movement in _context_amm_movements(context, str(action.pool_id)):
+        if movement == expected:
+            return
+    raise TransitionError("Pool escrow action is not authorized by AMM movement")
+
+
+def apply_action(
+    state: State,
+    action: Action,
+    *,
+    context: Any = None,
+    sl_id: bytes = SL_ID,
+    version: bytes = VERSION,
+) -> State:
     """
     F(S, Input) -> S'
 
@@ -453,13 +621,20 @@ def apply_action(state: State, action: Action) -> State:
         s.set_total_supply(s.get_total_supply(asset_id) - action.amount, asset_id)
         s.nonce = action.nonce
 
-    elif action.action_type == ActionType.TRANSFER:
+    elif action.action_type in {ActionType.TRANSFER, ActionType.BUNDLE_TRANSFER}:
         if asset_id != DEFAULT_ASSET_ID and not s.asset_record(asset_id):
             raise TransitionError(f"Unknown asset: {asset_id}")
         if action.from_addr is None or action.to is None:
             raise TransitionError("Transfer requires 'from_addr' and 'to'")
         if action.amount is None or action.amount <= 0:
             raise TransitionError("Transfer amount must be positive")
+        if action.action_type == ActionType.BUNDLE_TRANSFER:
+            if context is None:
+                raise TransitionError("Bundle transfer requires bundle context")
+            if str(action.bundle_id) != str(getattr(context, "bundle_id", "")):
+                raise TransitionError("bundle_id does not match bundle context")
+            if not action.leg_id:
+                raise TransitionError("Bundle transfer requires 'leg_id'")
         # Sender must authenticate as from_addr
         if sender_addr != action.from_addr:
             raise TransitionError(
@@ -479,6 +654,47 @@ def apply_action(state: State, action: Action) -> State:
             asset_id,
         )
         s.set_balance(action.to, s.get_balance(action.to, asset_id) + action.amount, asset_id)
+        s.nonce = action.nonce
+
+    elif action.action_type in {
+        ActionType.POOL_DEPOSIT,
+        ActionType.POOL_WITHDRAW,
+        ActionType.POOL_SWAP_IN,
+        ActionType.POOL_SWAP_OUT,
+    }:
+        if asset_id != DEFAULT_ASSET_ID and not s.asset_record(asset_id):
+            raise TransitionError(f"Unknown asset: {asset_id}")
+        if action.amount is None or action.amount <= 0:
+            raise TransitionError("Pool escrow amount must be positive")
+        if not action.pool_id:
+            raise TransitionError("Pool escrow action requires 'pool_id'")
+        address = _pool_action_address(action)
+        if sender_addr != address:
+            raise TransitionError(
+                f"Sender {sender_addr} does not match pool action address {address}"
+            )
+        if s.is_frozen(address, asset_id):
+            raise TransitionError(f"Address {address} is frozen")
+        _require_matching_amm_movement(
+            action,
+            context=context,
+            sl_id=sl_id,
+            version=version,
+        )
+        if action.action_type in {ActionType.POOL_DEPOSIT, ActionType.POOL_SWAP_IN}:
+            if s.get_balance(address, asset_id) < action.amount:
+                raise TransitionError(
+                    f"Insufficient balance: {s.get_balance(address, asset_id)} < {action.amount}"
+                )
+            s.set_balance(
+                address,
+                s.get_balance(address, asset_id) - action.amount,
+                asset_id,
+            )
+            s.credit_pool_escrow(action.pool_id, action.amount, asset_id)
+        else:
+            s.debit_pool_escrow(action.pool_id, action.amount, asset_id)
+            s.set_balance(address, s.get_balance(address, asset_id) + action.amount, asset_id)
         s.nonce = action.nonce
 
     elif action.action_type == ActionType.FREEZE:
@@ -510,9 +726,6 @@ def apply_action(state: State, action: Action) -> State:
 # ---------------------------------------------------------------------------
 # Batch processing & canonical payload generation
 # ---------------------------------------------------------------------------
-
-SL_ID = b"\x00\x01\x00\x01"   # 4 bytes — unique SL identifier
-VERSION = b"\x00\x01"          # 2 bytes — state machine version 0.1
 
 
 @dataclass
@@ -653,6 +866,7 @@ def process_batch(
     sequence: int = 1,
     sl_id: bytes = SL_ID,
     version: bytes = VERSION,
+    context: Any = None,
 ) -> tuple:
     """
     Process a batch of actions sequentially.
@@ -669,7 +883,7 @@ def process_batch(
 
     for i, action in enumerate(actions):
         try:
-            current = apply_action(current, action)
+            current = apply_action(current, action, context=context, sl_id=sl_id, version=version)
             applied_actions.append(action)
         except TransitionError as e:
             rejected.append((i, str(e)))
@@ -697,6 +911,9 @@ def verify_batch(
     prev_state: State,
     actions: list,
     claimed_new_hash: str,
+    context: Any = None,
+    sl_id: bytes = SL_ID,
+    version: bytes = VERSION,
 ) -> tuple:
     """
     Verifier re-executes the batch against prev_state
@@ -707,7 +924,7 @@ def verify_batch(
     current = prev_state.clone()
     for action in actions:
         try:
-            current = apply_action(current, action)
+            current = apply_action(current, action, context=context, sl_id=sl_id, version=version)
         except TransitionError as e:
             return False, f"Re-execution failed: {e}"
 

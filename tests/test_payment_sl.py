@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,7 @@ from core import (  # noqa: E402
     hash_vk,
     parse_data_field_payload,
     process_batch,
+    verify_batch,
 )
 from devnet_adapter import (  # noqa: E402
     envelope_from_scalars,
@@ -131,6 +133,132 @@ class PaymentSLTests(unittest.TestCase):
         self.assertEqual(next_state.get_balance(bob, "BSTK"), 40)
         self.assertEqual(next_state.get_total_supply("BSTK"), 100)
         self.assertEqual(next_state.total_supply, 0)
+
+    def test_pool_escrow_actions_require_matching_amm_movements(self):
+        issuer = "issuer_vk"
+        alice_vk = "alice_vk"
+        alice = hash_vk(alice_vk)
+        pool_id = "pool-spx-usd"
+        bundle_id = "11" * 32
+        state = State(issuer_vk=issuer)
+        seeded, _seed_result = process_batch(
+            state,
+            [
+                Action(
+                    ActionType.REGISTER_ASSET,
+                    issuer,
+                    1,
+                    asset_id="SPX",
+                    symbol="SPX",
+                    asset_name="SPX",
+                ),
+                Action(ActionType.MINT, issuer, 2, asset_id="SPX", to=alice, amount=1_000),
+            ],
+        )
+        movements = [
+            {
+                "kind": "swap_in",
+                "leg_id": "spx-in",
+                "pool_id": pool_id,
+                "sl_id": PAYMENT_PLUGIN.sl_id.hex(),
+                "version": PAYMENT_PLUGIN.version.hex(),
+                "asset_id": "SPX",
+                "address": alice,
+                "amount": 100,
+            },
+            {
+                "kind": "swap_out",
+                "leg_id": "spx-out",
+                "pool_id": pool_id,
+                "sl_id": PAYMENT_PLUGIN.sl_id.hex(),
+                "version": PAYMENT_PLUGIN.version.hex(),
+                "asset_id": "SPX",
+                "address": alice,
+                "amount": 25,
+            },
+        ]
+        context = SimpleNamespace(
+            bundle_id=bundle_id,
+            child_transitions=[{"sl_id": "00040001", "actions": [{"asset_movements": movements}]}],
+        )
+        seeded.credit_pool_escrow(pool_id, 40, "SPX")
+
+        next_state, result = process_batch(
+            seeded,
+            [
+                Action(
+                    ActionType.POOL_SWAP_IN,
+                    alice_vk,
+                    3,
+                    asset_id="SPX",
+                    pool_id=pool_id,
+                    leg_id="spx-in",
+                    trader=alice,
+                    amount=100,
+                    bundle_id=bundle_id,
+                ),
+                Action(
+                    ActionType.POOL_SWAP_OUT,
+                    alice_vk,
+                    4,
+                    asset_id="SPX",
+                    pool_id=pool_id,
+                    leg_id="spx-out",
+                    trader=alice,
+                    amount=25,
+                    bundle_id=bundle_id,
+                ),
+            ],
+            context=context,
+        )
+
+        self.assertEqual(result.rejected, [])
+        self.assertEqual(next_state.get_balance(alice, "SPX"), 925)
+        self.assertEqual(next_state.get_pool_escrow(pool_id, "SPX"), 115)
+
+        valid, msg = verify_batch(seeded, result.actions, result.new_state_hash, context=context)
+        self.assertTrue(valid, msg)
+
+    def test_pool_escrow_rejects_unmatched_amm_movement(self):
+        issuer = "issuer_vk"
+        alice_vk = "alice_vk"
+        alice = hash_vk(alice_vk)
+        state = State(issuer_vk=issuer)
+        seeded, _seed_result = process_batch(
+            state,
+            [
+                Action(
+                    ActionType.REGISTER_ASSET,
+                    issuer,
+                    1,
+                    asset_id="SPX",
+                    symbol="SPX",
+                    asset_name="SPX",
+                ),
+                Action(ActionType.MINT, issuer, 2, asset_id="SPX", to=alice, amount=1_000),
+            ],
+        )
+
+        _next_state, result = process_batch(
+            seeded,
+            [
+                Action(
+                    ActionType.POOL_SWAP_IN,
+                    alice_vk,
+                    3,
+                    asset_id="SPX",
+                    pool_id="pool-spx-usd",
+                    leg_id="spx-in",
+                    trader=alice,
+                    amount=100,
+                    bundle_id="11" * 32,
+                )
+            ],
+            context=SimpleNamespace(bundle_id="11" * 32, child_transitions=[]),
+        )
+
+        self.assertEqual(result.applied, 0)
+        self.assertIn("not authorized by AMM movement", result.rejected[0][1])
 
     def test_custom_asset_hash_survives_sorted_json_round_trip(self):
         issuer = "issuer_vk"

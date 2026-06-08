@@ -9,6 +9,7 @@ from core import (
     State,
     apply_action,
     parse_data_field_payload,
+    process_batch,
     verify_batch,
 )
 from verifier_engine.plugins import VerificationResult
@@ -97,7 +98,33 @@ class PaymentSLPlugin:
         )
         return result.data_field_payload().hex()
 
-    def verify_transition(self, prev_state: State, transition: dict) -> VerificationResult:
+    def build_payload(
+        self,
+        prev_state: State,
+        actions: list[dict],
+        *,
+        sequence: int,
+        bundle_id: str | None = None,
+        context=None,
+    ) -> tuple[State, bytes]:
+        typed_actions = [
+            Action.from_dict({**action, **({"bundle_id": bundle_id} if bundle_id else {})})
+            for action in actions
+        ]
+        next_state, result = process_batch(
+            prev_state,
+            typed_actions,
+            sequence=sequence,
+            sl_id=self.sl_id,
+            version=self.version,
+            context=context,
+        )
+        if result.rejected:
+            index, reason = result.rejected[0]
+            raise ValueError(f"Payment SL action #{index} rejected: {reason}")
+        return next_state, result.data_field_payload()
+
+    def verify_transition(self, prev_state: State, transition: dict, context=None) -> VerificationResult:
         sequence = int(transition["sequence"])
         actions = [Action.from_dict(d) for d in transition["actions_applied"]]
 
@@ -118,12 +145,25 @@ class PaymentSLPlugin:
                 payload_hex=transition["payload_hex"],
             )
 
-        valid, msg = verify_batch(prev_state, actions, transition["new_state_hash"])
+        valid, msg = verify_batch(
+            prev_state,
+            actions,
+            transition["new_state_hash"],
+            context=context,
+            sl_id=self.sl_id,
+            version=self.version,
+        )
         next_state = None
         if valid:
             next_state = prev_state
             for action in actions:
-                next_state = apply_action(next_state, action)
+                next_state = apply_action(
+                    next_state,
+                    action,
+                    context=context,
+                    sl_id=self.sl_id,
+                    version=self.version,
+                )
 
         return VerificationResult(
             valid=valid,
