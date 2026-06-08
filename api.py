@@ -1225,20 +1225,6 @@ def config() -> dict:
     return _config_response()
 
 
-@app.post("/reset")
-def reset() -> dict:
-    with STATE_LOCK:
-        STORE.reset()
-        _verifier_store().reset()
-        return {
-            "reset": True,
-            "storage": {
-                "type": "sqlite",
-                "db_path": str(STORE.db_path),
-            },
-        }
-
-
 @app.post("/operator/init")
 def operator_init(request: InitRequest) -> dict:
     with STATE_LOCK:
@@ -1283,7 +1269,7 @@ def operator_init(request: InitRequest) -> dict:
             if not request.reset_existing:
                 raise HTTPException(
                     status_code=409,
-                    detail="SL runtime is already initialized. Use reset_existing=true or POST /reset.",
+                    detail="SL runtime is already initialized. Use reset_existing=true only for a scoped runtime rebuild.",
                 )
             _verifier_store().reset_layer(bytes.fromhex(sl_id), bytes.fromhex(version))
 

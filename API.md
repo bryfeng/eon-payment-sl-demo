@@ -80,7 +80,6 @@ change in the same commit.
 GET /
 GET /health
 GET /config
-POST /reset
 POST /operator/init
 GET /operator/state
 POST /wallets
@@ -123,14 +122,10 @@ POST /verifier/ingest-event
 GET /
 GET /health
 GET /config
-POST /reset
 ```
 
 `GET /` returns a short liveness message for quick browser checks of the public
 Railway URL. `GET /health` remains the machine-readable health check.
-
-`POST /reset` clears the shared demo world in SQLite: operator state, pending
-actions, operator batches, wallet registry, verifier state, and verifier log.
 
 ### Operator Init
 
@@ -524,11 +519,6 @@ The executable smoke flow below is also tested. Variables such as
 
 ```api-smoke-test
 [
-  {
-    "name": "reset",
-    "method": "POST",
-    "path": "/reset"
-  },
   {
     "name": "init",
     "method": "POST",
