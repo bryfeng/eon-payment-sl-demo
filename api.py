@@ -9,6 +9,7 @@ can be hosted on a persistent Railway volume.
 import os
 import sqlite3
 import re
+import sys
 import time
 from threading import RLock
 from pathlib import Path
@@ -37,6 +38,22 @@ from storage import DEFAULT_DB_PATH, SQLiteStorage
 from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore
 from verifier_engine.eon_data import ScalarFramingError, payload_bytes_to_scalar_hex
 from verifier_engine.sources import BaseLayerAPIEventSource
+
+_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "eon-marketplace-stack" / "packages"
+for _package in ("eon-protocol-schemas", "eon-amm-framework", "eon-settlement-framework"):
+    _package_path = _PACKAGE_ROOT / _package
+    if _package_path.exists() and str(_package_path) not in sys.path:
+        sys.path.append(str(_package_path))
+
+try:
+    from eon_amm import AMMPlugin
+except ModuleNotFoundError:
+    AMMPlugin = None
+
+try:
+    from eon_settlement import SettlementPlugin
+except ModuleNotFoundError:
+    SettlementPlugin = None
 
 
 STATE_LOCK = RLock()
@@ -550,9 +567,19 @@ def _verifier_store() -> VerifierStore:
 
 def _verifier_engine() -> VerifierEngine:
     config = {}
-    plugins_by_key: dict[tuple[str, str], PaymentSLPlugin] = {
+    plugins_by_key: dict[tuple[str, str], Any] = {
         (PAYMENT_PLUGIN.sl_id.hex(), core.VERSION.hex()): PAYMENT_PLUGIN
     }
+    if AMMPlugin is not None:
+        amm_sl_id = _sl_id_bytes(os.environ.get("AMM_SL_ID", "00040001"))
+        amm_version = bytes.fromhex(_version_hex(os.environ.get("AMM_VERSION", core.VERSION.hex())))
+        amm_plugin = AMMPlugin(amm_sl_id, amm_version)
+        plugins_by_key[(amm_sl_id.hex(), amm_version.hex())] = amm_plugin
+    if SettlementPlugin is not None:
+        settlement_sl_id = _sl_id_bytes(os.environ.get("SETTLEMENT_SL_ID", "00030001"))
+        settlement_version = bytes.fromhex(_version_hex(os.environ.get("SETTLEMENT_VERSION", core.VERSION.hex())))
+        settlement_plugin = SettlementPlugin(settlement_sl_id, settlement_version)
+        plugins_by_key[(settlement_sl_id.hex(), settlement_version.hex())] = settlement_plugin
     for runtime in STORE.list_runtime_configs():
         sl_id_hex = str(runtime["sl_id"])
         version_hex = str(runtime["version"])

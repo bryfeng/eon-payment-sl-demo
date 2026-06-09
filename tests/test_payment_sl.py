@@ -8,6 +8,11 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+PACKAGE_ROOT = ROOT.parent / "eon-marketplace-stack" / "packages"
+for PACKAGE in ("eon-protocol-schemas", "eon-amm-framework", "eon-settlement-framework"):
+    package_path = PACKAGE_ROOT / PACKAGE
+    if package_path.exists():
+        sys.path.insert(0, str(package_path))
 
 from core import (  # noqa: E402
     Action,
@@ -24,10 +29,22 @@ from devnet_adapter import (  # noqa: E402
     payload_bytes_to_scalar_hex,
     scalar_hex_to_payload_bytes,
 )
-from payment_plugin import PAYMENT_PLUGIN  # noqa: E402
+from payment_plugin import PAYMENT_PLUGIN, PaymentSLPlugin  # noqa: E402
 from verifier import _state_after_envelope, verify_envelope  # noqa: E402
 from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore  # noqa: E402
-from verifier_engine.eon_data import payload_header  # noqa: E402
+from verifier_engine.eon_data import encode_bundle_payload, payload_header  # noqa: E402
+
+try:
+    from eon_amm import AMMPlugin, AMMState  # noqa: E402
+    from eon_amm.framework import expected_asset_movements  # noqa: E402
+    from eon_settlement import SettlementContext, SettlementPlugin, SettlementState  # noqa: E402
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - standalone payment_sl checkout
+    AMMPlugin = None
+    AMMState = None
+    expected_asset_movements = None
+    SettlementContext = None
+    SettlementPlugin = None
+    SettlementState = None
 
 
 class PaymentSLTests(unittest.TestCase):
@@ -339,6 +356,344 @@ class PaymentSLTests(unittest.TestCase):
         self.assertTrue(first["accepted"], first)
         self.assertTrue(second["duplicate"], second)
         self.assertEqual(checkpoint["state_hash"], envelope["new_state_hash"])
+
+    def test_engine_ingests_registered_child_from_bundle_event(self):
+        envelope = self._valid_envelope()
+        child_payload = bytes.fromhex(envelope["payload_hex"])
+        bundle_payload = encode_bundle_payload(
+            bundle_id="ab" * 32,
+            children=[
+                b"\x99\x99\x99\x99\x00\x01ignored",
+                child_payload,
+            ],
+        )
+        event = {
+            "cursor": "devnet:bundle:0:0",
+            "network_id": "devnet",
+            "height": 1,
+            "tx_hash": "0xbundle",
+            "tx_index": 0,
+            "output_index": 0,
+            "utxo_id": "0xbundleutxo",
+            "owner": "0xowner",
+            "amount": "1",
+            "data_scalars": payload_bytes_to_scalar_hex(bundle_payload),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            engine = VerifierEngine(
+                store,
+                PluginRegistry([PAYMENT_PLUGIN]),
+                {PAYMENT_PLUGIN.sl_id.hex(): {"issuer_vk": "issuer_vk"}},
+            )
+
+            result = engine.ingest_event(event)
+            checkpoint = store.load_checkpoint(PAYMENT_PLUGIN.sl_id, next(iter(PAYMENT_PLUGIN.supported_versions)))
+            log = store.list_verification_log(PAYMENT_PLUGIN.sl_id)
+
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(result["bundle_id"], "ab" * 32)
+        self.assertEqual(result["children"][0]["state_hash"], envelope["new_state_hash"])
+        self.assertEqual(checkpoint["state_hash"], envelope["new_state_hash"])
+        self.assertEqual(len(log), 1)
+        self.assertEqual(log[0]["event_key"], result["event_key"])
+
+    def test_engine_retries_previously_ignored_bundle_when_plugin_is_registered(self):
+        envelope = self._valid_envelope()
+        bundle_payload = encode_bundle_payload(
+            bundle_id="cd" * 32,
+            children=[bytes.fromhex(envelope["payload_hex"])],
+        )
+        event = {
+            "cursor": "devnet:bundle-retry:0:0",
+            "network_id": "devnet",
+            "height": 1,
+            "tx_hash": "0xbundleretry",
+            "tx_index": 0,
+            "output_index": 0,
+            "data_scalars": payload_bytes_to_scalar_hex(bundle_payload),
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            first_engine = VerifierEngine(store, PluginRegistry([]))
+            ignored = first_engine.ingest_event(event)
+
+            second_engine = VerifierEngine(
+                store,
+                PluginRegistry([PAYMENT_PLUGIN]),
+                {PAYMENT_PLUGIN.sl_id.hex(): {"issuer_vk": "issuer_vk"}},
+            )
+            accepted = second_engine.ingest_event(event)
+            checkpoint = store.load_checkpoint(PAYMENT_PLUGIN.sl_id, next(iter(PAYMENT_PLUGIN.supported_versions)))
+
+        self.assertTrue(ignored["ignored"], ignored)
+        self.assertIn("no registered semantic-layer children", ignored["message"])
+        self.assertTrue(accepted["accepted"], accepted)
+        self.assertEqual(checkpoint["state_hash"], envelope["new_state_hash"])
+
+    @unittest.skipUnless(AMMPlugin and SettlementPlugin, "marketplace framework packages unavailable")
+    def test_engine_verifies_marketplace_bundle_children_with_settlement_and_amm_context(self):
+        version = PAYMENT_PLUGIN.version
+        spx_plugin = PaymentSLPlugin(b"\x00\x01\x10\x01", version)
+        usdc_plugin = PaymentSLPlugin(b"\x00\x01\x10\x02", version)
+        amm_plugin = AMMPlugin(b"\x00\x04\x00\x01", version)
+        settlement_plugin = SettlementPlugin(b"\x00\x03\x00\x01", version)
+        provider_vk = "provider_vk"
+        provider = hash_vk(provider_vk)
+        pool_id = "pool-spx-usdc"
+        spx_ref = {"sl_id": spx_plugin.sl_id.hex(), "version": version.hex(), "asset_id": "SPX"}
+        usdc_ref = {"sl_id": usdc_plugin.sl_id.hex(), "version": version.hex(), "asset_id": "USDC"}
+
+        def event_for_payload(payload: bytes, suffix: str, height: int = 1):
+            return {
+                "cursor": f"devnet:{height}:{suffix}:0",
+                "network_id": "devnet",
+                "height": height,
+                "tx_hash": f"0x{suffix}",
+                "tx_index": 0,
+                "output_index": 0,
+                "data_scalars": payload_bytes_to_scalar_hex(payload),
+            }
+
+        def context_transition(transition: dict):
+            if "actions" in transition:
+                return transition
+            return {**transition, "actions": transition["actions_applied"]}
+
+        spx_state, spx_seed = spx_plugin.build_payload(
+            State(issuer_vk="spx_issuer"),
+            [
+                {
+                    "type": "register_asset",
+                    "sender_vk": "spx_issuer",
+                    "nonce": 1,
+                    "asset_id": "SPX",
+                    "symbol": "SPX",
+                    "asset_name": "SPX",
+                },
+                {
+                    "type": "mint",
+                    "sender_vk": "spx_issuer",
+                    "nonce": 2,
+                    "asset_id": "SPX",
+                    "to": provider,
+                    "amount": 1_000,
+                },
+            ],
+            sequence=1,
+        )
+        usdc_state, usdc_seed = usdc_plugin.build_payload(
+            State(issuer_vk="usdc_issuer"),
+            [
+                {
+                    "type": "register_asset",
+                    "sender_vk": "usdc_issuer",
+                    "nonce": 1,
+                    "asset_id": "USDC",
+                    "symbol": "USDC",
+                    "asset_name": "USDC",
+                },
+                {
+                    "type": "mint",
+                    "sender_vk": "usdc_issuer",
+                    "nonce": 2,
+                    "asset_id": "USDC",
+                    "to": provider,
+                    "amount": 2_000,
+                },
+            ],
+            sequence=1,
+        )
+
+        amm_state = AMMState()
+        settlement_state = SettlementState()
+        create_bundle_id = "01" * 32
+        create_action = {
+            "type": "create_pool",
+            "nonce": 1,
+            "pool_id": pool_id,
+            "asset_a": spx_ref,
+            "asset_b": usdc_ref,
+            "fee_bps": 30,
+        }
+        amm_state, create_amm_payload = amm_plugin.build_payload(
+            amm_state,
+            [create_action],
+            sequence=1,
+        )
+        create_amm_transition = amm_plugin.parse_payload(create_amm_payload)
+        create_settlement_context = SettlementContext(
+            bundle_id=create_bundle_id,
+            child_transitions=[create_amm_transition],
+            height=2,
+        )
+        settlement_state, create_settlement_payload = settlement_plugin.build_payload(
+            settlement_state,
+            {
+                "type": "settle_bundle",
+                "nonce": 1,
+                "bundle_id": create_bundle_id,
+                "settlement_id": "create-pool",
+                "expected_legs": [],
+                "fees": [],
+                "matcher_id": "test",
+            },
+            sequence=1,
+            context=create_settlement_context,
+        )
+        create_bundle = encode_bundle_payload(
+            bundle_id=create_bundle_id,
+            children=[create_settlement_payload, create_amm_payload],
+        )
+
+        liquidity_bundle_id = "02" * 32
+        liquidity_action = {
+            "type": "add_liquidity",
+            "nonce": 2,
+            "pool_id": pool_id,
+            "provider": provider,
+            "amount_a": 100,
+            "amount_b": 200,
+            "min_lp_shares": 1,
+            "asset_a_leg_id": "spx-deposit",
+            "asset_b_leg_id": "usdc-deposit",
+        }
+        liquidity_action["asset_movements"] = expected_asset_movements(liquidity_action, amm_state)
+        amm_next, liquidity_amm_payload = amm_plugin.build_payload(
+            amm_state,
+            [liquidity_action],
+            sequence=2,
+        )
+        liquidity_amm_transition = amm_plugin.parse_payload(liquidity_amm_payload)
+        asset_context = SimpleNamespace(
+            bundle_id=liquidity_bundle_id,
+            child_transitions=[liquidity_amm_transition],
+            height=3,
+        )
+        spx_next, spx_child = spx_plugin.build_payload(
+            spx_state,
+            [
+                {
+                    "type": "pool_deposit",
+                    "sender_vk": provider_vk,
+                    "nonce": 3,
+                    "asset_id": "SPX",
+                    "pool_id": pool_id,
+                    "leg_id": "spx-deposit",
+                    "owner": provider,
+                    "amount": 100,
+                }
+            ],
+            sequence=2,
+            bundle_id=liquidity_bundle_id,
+            context=asset_context,
+        )
+        usdc_next, usdc_child = usdc_plugin.build_payload(
+            usdc_state,
+            [
+                {
+                    "type": "pool_deposit",
+                    "sender_vk": provider_vk,
+                    "nonce": 3,
+                    "asset_id": "USDC",
+                    "pool_id": pool_id,
+                    "leg_id": "usdc-deposit",
+                    "owner": provider,
+                    "amount": 200,
+                }
+            ],
+            sequence=2,
+            bundle_id=liquidity_bundle_id,
+            context=asset_context,
+        )
+        spx_transition = spx_plugin.parse_payload(spx_child)
+        usdc_transition = usdc_plugin.parse_payload(usdc_child)
+        settlement_context = SettlementContext(
+            bundle_id=liquidity_bundle_id,
+            child_transitions=[
+                liquidity_amm_transition,
+                context_transition(spx_transition),
+                context_transition(usdc_transition),
+            ],
+            height=3,
+        )
+        settlement_state, settlement_child = settlement_plugin.build_payload(
+            settlement_state,
+            {
+                "type": "settle_bundle",
+                "nonce": 2,
+                "bundle_id": liquidity_bundle_id,
+                "settlement_id": "add-liquidity",
+                "expected_legs": [
+                    {
+                        "sl_id": spx_plugin.sl_id.hex(),
+                        "leg_id": "spx-deposit",
+                        "pool_id": pool_id,
+                        "asset_id": "SPX",
+                        "from_addr": provider,
+                        "to": f"pool:{pool_id}",
+                        "amount": 100,
+                    },
+                    {
+                        "sl_id": usdc_plugin.sl_id.hex(),
+                        "leg_id": "usdc-deposit",
+                        "pool_id": pool_id,
+                        "asset_id": "USDC",
+                        "from_addr": provider,
+                        "to": f"pool:{pool_id}",
+                        "amount": 200,
+                    },
+                ],
+                "fees": [],
+                "matcher_id": "test",
+            },
+            sequence=2,
+            context=settlement_context,
+        )
+        liquidity_bundle = encode_bundle_payload(
+            bundle_id=liquidity_bundle_id,
+            children=[settlement_child, liquidity_amm_payload, spx_child, usdc_child],
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            engine = VerifierEngine(
+                store,
+                PluginRegistry([settlement_plugin, amm_plugin, spx_plugin, usdc_plugin]),
+                {
+                    spx_plugin.sl_id.hex(): {"issuer_vk": "spx_issuer"},
+                    usdc_plugin.sl_id.hex(): {"issuer_vk": "usdc_issuer"},
+                },
+            )
+
+            self.assertTrue(engine.ingest_event(event_for_payload(spx_seed, "spxseed"))["accepted"])
+            self.assertTrue(engine.ingest_event(event_for_payload(usdc_seed, "usdcseed"))["accepted"])
+            self.assertTrue(engine.ingest_event(event_for_payload(create_bundle, "createpool", 2))["accepted"])
+            result = engine.ingest_event(event_for_payload(liquidity_bundle, "liquidity", 3))
+            spx_checkpoint = store.load_checkpoint(spx_plugin.sl_id, version)
+            usdc_checkpoint = store.load_checkpoint(usdc_plugin.sl_id, version)
+            amm_checkpoint = store.load_checkpoint(amm_plugin.sl_id, version)
+            settlement_checkpoint = store.load_checkpoint(settlement_plugin.sl_id, version)
+
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual({child["sl_id"] for child in result["children"]}, {
+            settlement_plugin.sl_id.hex(),
+            amm_plugin.sl_id.hex(),
+            spx_plugin.sl_id.hex(),
+            usdc_plugin.sl_id.hex(),
+        })
+        self.assertEqual(spx_checkpoint["state_hash"], spx_next.state_hash())
+        self.assertEqual(usdc_checkpoint["state_hash"], usdc_next.state_hash())
+        self.assertEqual(amm_checkpoint["state_hash"], amm_next.state_hash())
+        self.assertEqual(settlement_checkpoint["state_hash"], settlement_state.state_hash())
+        verified_spx = State.from_dict(spx_checkpoint["state"])
+        verified_usdc = State.from_dict(usdc_checkpoint["state"])
+        self.assertEqual(verified_spx.get_balance(provider, "SPX"), 900)
+        self.assertEqual(verified_spx.get_pool_escrow(pool_id, "SPX"), 100)
+        self.assertEqual(verified_usdc.get_balance(provider, "USDC"), 1_800)
+        self.assertEqual(verified_usdc.get_pool_escrow(pool_id, "USDC"), 200)
 
     def test_engine_defers_future_sequence_without_poisoning_event(self):
         issuer = "issuer_vk"
