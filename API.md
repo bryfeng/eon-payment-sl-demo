@@ -101,6 +101,8 @@ POST /actions/transfer
 GET /pending
 GET /pending/all
 POST /operator/batch
+POST /operator/execution-request
+POST /operator/sync-from-verifier
 GET /operator/batches
 GET /operator/latest-payload
 POST /devnet/encode-payload
@@ -145,6 +147,22 @@ Request:
 ```
 
 This creates the genesis operator state and initializes batch sequence `1`.
+
+### Operator Intake
+
+```http
+POST /operator/batch
+POST /operator/execution-request
+POST /operator/sync-from-verifier
+```
+
+`POST /operator/batch` batches locally queued actions. `POST
+/operator/execution-request` accepts wallet-signed marketplace proposal intents,
+applies matching pool escrow actions with the proposal's AMM context, posts the
+resulting semantic-layer payloads to base when configured, and returns operator
+receipts. `POST /operator/sync-from-verifier` is a manual repair/debug endpoint
+that moves operator state to the latest verifier checkpoint before accepting new
+actions.
 
 ### Wallet Registry
 

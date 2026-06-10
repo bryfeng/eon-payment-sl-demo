@@ -1425,17 +1425,20 @@ class SQLiteStorage:
         sequence: int,
         sl_id: str = core.SL_ID.hex(),
         version: str = core.VERSION.hex(),
+        *,
+        clear_pending: bool = True,
     ) -> None:
         with self.connect() as conn:
             config = self._get_runtime_config(conn, sl_id, version)
             self._put_scoped_state(conn, sl_id, version, "operator", new_state)
-            conn.execute(
-                """
-                DELETE FROM sl_pending_actions
-                WHERE sl_id = ? AND version = ?
-                """,
-                (sl_id, version),
-            )
+            if clear_pending:
+                conn.execute(
+                    """
+                    DELETE FROM sl_pending_actions
+                    WHERE sl_id = ? AND version = ?
+                    """,
+                    (sl_id, version),
+                )
             self._put_runtime_config(
                 conn,
                 sl_id,
@@ -1471,8 +1474,9 @@ class SQLiteStorage:
 
             if sl_id == core.SL_ID.hex() and version == core.VERSION.hex():
                 self._put_state(conn, "operator", new_state)
-                conn.execute("DELETE FROM pending_actions")
-                conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_actions'")
+                if clear_pending:
+                    conn.execute("DELETE FROM pending_actions")
+                    conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_actions'")
                 self._put_json(conn, "operator_meta", {"next_sequence": sequence + 1})
                 conn.execute(
                     """

@@ -831,6 +831,150 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["balance"], 40)
 
+    def test_operator_execution_request_processes_pool_deposit_intents(self):
+        operator = self._operator_wallet()
+        sl_id = "00010002"
+        version = VERSION.hex()
+        provider = self._wallet("Provider", "provider_vk")
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Pool Assets",
+                "sl_id": sl_id,
+                "version": version,
+                "operator_wallet_address": operator["address"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(
+            "/operator/init",
+            json={"issuer_vk": "issuer_vk", "sl_id": sl_id, "version": version},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        for asset_id, amount in [("SPX", 1_000), ("USDC", 5_000)]:
+            response = self.client.post(
+                f"/semantic-layers/{sl_id}/assets?version={version}",
+                json={"asset_id": asset_id, "symbol": asset_id, "name": asset_id},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+            response = self.client.post(
+                "/actions/mint",
+                json={
+                    "to_address": provider["address"],
+                    "amount": amount,
+                    "asset_id": asset_id,
+                    "sl_id": sl_id,
+                    "version": version,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(f"/operator/batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["applied"], 4)
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        pool_id = "pool-spx-usdc"
+        proposal_id = "proposal-pool-deposit"
+        bundle_id = "11" * 32
+        movements = [
+            {
+                "kind": "deposit",
+                "leg_id": f"{pool_id}:deposit:a",
+                "pool_id": pool_id,
+                "sl_id": sl_id,
+                "version": version,
+                "asset_id": "SPX",
+                "address": provider["address"],
+                "amount": 100,
+            },
+            {
+                "kind": "deposit",
+                "leg_id": f"{pool_id}:deposit:b",
+                "pool_id": pool_id,
+                "sl_id": sl_id,
+                "version": version,
+                "asset_id": "USDC",
+                "address": provider["address"],
+                "amount": 500,
+            },
+        ]
+        required_intents = []
+        for index, movement in enumerate(movements):
+            required_intents.append({
+                "proposal_id": proposal_id,
+                "action": movement["kind"],
+                "signer": provider["address"],
+                "nonce": 5 + index,
+                "asset_ref": {
+                    "sl_id": sl_id,
+                    "version": version,
+                    "asset_id": movement["asset_id"],
+                },
+                "payload": {
+                    "amount": movement["amount"],
+                    "pool_id": pool_id,
+                    "leg_id": movement["leg_id"],
+                    "address": provider["address"],
+                },
+                "expires_at_height": 100,
+            })
+        signed_intents = [
+            {
+                **intent,
+                "signer_vk": "provider_vk",
+                "signature": api._demo_intent_signature(intent, "provider_vk"),
+            }
+            for intent in required_intents
+        ]
+        proposal = {
+            "proposal_id": proposal_id,
+            "kind": "add_liquidity",
+            "terms": {
+                "proposal_id": proposal_id,
+                "pool_id": pool_id,
+                "provider": provider["address"],
+                "amount_a": 100,
+                "amount_b": 500,
+                "min_lp_shares": 1,
+                "bundle_id": bundle_id,
+                "settlement_id": "settlement-pool-deposit",
+                "height": 1,
+                "asset_movements": movements,
+            },
+            "required_intents": required_intents,
+        }
+
+        response = self.client.post(
+            "/operator/execution-request",
+            json={
+                "proposal_id": proposal_id,
+                "proposal": proposal,
+                "signed_intents": signed_intents,
+                "submit_to_base": False,
+                "wait_for_verifier": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["receipt_count"], 2)
+        self.assertEqual(body["groups"][0]["batch"]["applied"], 2)
+        self.assertFalse(body["receipts"][0]["accepted"])
+
+        spx_balance = self.client.get(
+            f"/balances/{provider['address']}?source=operator&sl_id={sl_id}&version={version}&asset_id=SPX"
+        )
+        usdc_balance = self.client.get(
+            f"/balances/{provider['address']}?source=operator&sl_id={sl_id}&version={version}&asset_id=USDC"
+        )
+        self.assertEqual(spx_balance.status_code, 200, spx_balance.text)
+        self.assertEqual(usdc_balance.status_code, 200, usdc_balance.text)
+        self.assertEqual(spx_balance.json()["balance"], 900)
+        self.assertEqual(usdc_balance.json()["balance"], 4_500)
+
     def test_semantic_layer_record_hydrates_existing_runtime_metadata(self):
         self._init()
         operator = self._operator_wallet()

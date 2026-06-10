@@ -6,10 +6,13 @@ logic with SQLite-backed runtime storage, so this is one shared demo world that
 can be hosted on a persistent Railway volume.
 """
 
+import hashlib
+import json
 import os
 import sqlite3
 import re
 import time
+from types import SimpleNamespace
 from threading import Event, RLock, Thread
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
@@ -184,6 +187,35 @@ class VerifierSyncRequest(BaseModel):
     expected_state_hash: Optional[str] = None
     timeout_seconds: int = Field(default=0, ge=0, le=300)
     poll_interval_seconds: float = Field(default=5, gt=0, le=30)
+
+
+class IntentAssetRefRequest(BaseModel):
+    sl_id: str = Field(min_length=1)
+    version: str = Field(default=core.VERSION.hex(), min_length=1)
+    asset_id: str = Field(min_length=1)
+
+
+class SignedIntentRequest(BaseModel):
+    proposal_id: str = Field(min_length=1)
+    action: str = Field(min_length=1)
+    signer: str = Field(min_length=1)
+    signer_vk: str = Field(min_length=1)
+    nonce: int = Field(ge=0)
+    asset_ref: Optional[IntentAssetRefRequest] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    expires_at_height: Optional[int] = Field(default=None, ge=0)
+    max_fee_bps: Optional[int] = Field(default=None, ge=0, lt=10_000)
+    signature: str = Field(min_length=1)
+
+
+class OperatorExecutionRequest(BaseModel):
+    proposal_id: str = Field(min_length=1)
+    proposal: dict[str, Any] = Field(default_factory=dict)
+    signed_intents: list[SignedIntentRequest] = Field(default_factory=list)
+    submit_to_base: bool = True
+    wait_for_verifier: bool = True
+    verifier_timeout_seconds: int = Field(default=120, ge=0, le=300)
+    verifier_poll_interval_seconds: float = Field(default=5, gt=0, le=30)
 
 
 class VerifierNotifyRequest(BaseModel):
@@ -779,6 +811,204 @@ def _model_to_dict(model: BaseModel) -> dict:
     return model.dict(exclude_none=True)
 
 
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _normalize_intent_ref(value: Optional[dict[str, Any]]) -> Optional[dict[str, str]]:
+    if value is None:
+        return None
+    sl_id = str(value["sl_id"]).lower().removeprefix("0x")
+    version = str(value.get("version", core.VERSION.hex())).lower().removeprefix("0x")
+    try:
+        if len(bytes.fromhex(sl_id)) != 4:
+            raise ValueError
+        if len(bytes.fromhex(version)) != 2:
+            raise ValueError
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail="signed intent asset_ref has invalid layer coordinates") from e
+    return {
+        "sl_id": sl_id,
+        "version": version,
+        "asset_id": str(value["asset_id"]).upper(),
+    }
+
+
+def _intent_signing_payload(intent: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "proposal_id": intent["proposal_id"],
+        "action": intent["action"],
+        "signer": str(intent["signer"]).lower(),
+        "nonce": int(intent["nonce"]),
+        "asset_ref": _normalize_intent_ref(intent.get("asset_ref")),
+        "payload": intent.get("payload") or {},
+        "expires_at_height": intent.get("expires_at_height"),
+        "max_fee_bps": intent.get("max_fee_bps"),
+    }
+    return {key: value for key, value in payload.items() if value is not None}
+
+
+def _demo_intent_signature(intent: dict[str, Any], signer_vk: str) -> str:
+    payload = _canonical_json(_intent_signing_payload(intent))
+    return hashlib.sha256(f"{payload}:{signer_vk}".encode()).hexdigest()
+
+
+def _normalized_signed_intent(intent: SignedIntentRequest) -> dict[str, Any]:
+    data = _model_to_dict(intent)
+    data["signer"] = str(data["signer"]).lower()
+    if data.get("asset_ref") is not None:
+        data["asset_ref"] = _normalize_intent_ref(data["asset_ref"])
+    return data
+
+
+def _validate_execution_signed_intents(request: OperatorExecutionRequest) -> list[dict[str, Any]]:
+    proposal = request.proposal or {}
+    proposal_id = str(proposal.get("proposal_id") or request.proposal_id)
+    if proposal_id != request.proposal_id:
+        raise HTTPException(status_code=400, detail="execution request proposal_id does not match proposal")
+    terms = proposal.get("terms") or {}
+    height = int(terms.get("height", 0))
+    required = [
+        _intent_signing_payload(intent)
+        for intent in proposal.get("required_intents", [])
+    ]
+    supplied = [_normalized_signed_intent(intent) for intent in request.signed_intents]
+
+    if not required:
+        raise HTTPException(status_code=400, detail="proposal has no semantic-layer intents for operator execution")
+    if len(supplied) != len(required):
+        raise HTTPException(
+            status_code=400,
+            detail=f"expected {len(required)} signed intents, got {len(supplied)}",
+        )
+
+    unmatched = list(required)
+    for intent in supplied:
+        if intent["proposal_id"] != proposal_id:
+            raise HTTPException(status_code=400, detail="signed intent proposal_id does not match execution proposal")
+        if core.hash_vk(intent["signer_vk"]) != intent["signer"]:
+            raise HTTPException(status_code=400, detail="signed intent signer_vk does not match signer")
+        if _demo_intent_signature(intent, intent["signer_vk"]) != intent["signature"]:
+            raise HTTPException(status_code=400, detail="signed intent signature is invalid")
+        expires_at_height = intent.get("expires_at_height")
+        if expires_at_height is not None and height > int(expires_at_height):
+            raise HTTPException(status_code=400, detail="signed intent is expired")
+
+        signing_payload = _intent_signing_payload(intent)
+        for index, candidate in enumerate(unmatched):
+            if signing_payload == candidate:
+                unmatched.pop(index)
+                break
+        else:
+            raise HTTPException(status_code=400, detail="signed intent does not match proposal requirements")
+
+    if unmatched:
+        raise HTTPException(status_code=400, detail="missing signed intents for proposal")
+    return supplied
+
+
+def _amm_action_from_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
+    kind = str(proposal.get("kind") or "")
+    terms = proposal.get("terms") or {}
+    movements = terms.get("asset_movements") or []
+    if kind == "add_liquidity":
+        return {
+            "type": "add_liquidity",
+            "nonce": int(terms.get("amm_nonce") or 0),
+            "pool_id": str(terms["pool_id"]),
+            "provider": str(terms["provider"]),
+            "amount_a": int(terms["amount_a"]),
+            "amount_b": int(terms["amount_b"]),
+            "min_lp_shares": int(terms.get("min_lp_shares", 1)),
+            "asset_movements": movements,
+        }
+    if kind == "swap_exact_in":
+        action = {
+            "type": "swap_exact_in",
+            "nonce": int(terms.get("amm_nonce") or 0),
+            "pool_id": str(terms["pool_id"]),
+            "trader": str(terms["trader"]),
+            "input_asset": terms["input_asset"],
+            "amount_in": int(terms["amount_in"]),
+            "min_amount_out": int(terms.get("min_amount_out", 0)),
+            "amount_out": int(terms["amount_out"]),
+            "asset_movements": movements,
+        }
+        if terms.get("deadline_height") is not None:
+            action["deadline_height"] = int(terms["deadline_height"])
+        return action
+    raise HTTPException(status_code=400, detail=f"unsupported operator execution proposal kind: {kind}")
+
+
+def _execution_context_from_proposal(proposal: dict[str, Any]) -> SimpleNamespace:
+    terms = proposal.get("terms") or {}
+    bundle_id = str(terms.get("bundle_id") or "")
+    if not bundle_id:
+        raise HTTPException(status_code=400, detail="proposal terms missing bundle_id")
+    return SimpleNamespace(
+        bundle_id=bundle_id,
+        child_transitions=[
+            {
+                "sl_id": str(terms.get("amm_sl_id") or "marketplace_amm"),
+                "actions": [_amm_action_from_proposal(proposal)],
+            }
+        ],
+        height=terms.get("height"),
+    )
+
+
+def _pool_action_from_intent(intent: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
+    asset_ref = intent.get("asset_ref")
+    if not asset_ref:
+        raise HTTPException(status_code=400, detail="signed pool intent is missing asset_ref")
+    payload = intent.get("payload") or {}
+    action_kind = str(intent["action"])
+    if action_kind == "deposit":
+        action_type = core.ActionType.POOL_DEPOSIT.value
+        address_field = "owner"
+    elif action_kind == "withdraw":
+        action_type = core.ActionType.POOL_WITHDRAW.value
+        address_field = "owner"
+    elif action_kind == "swap_in":
+        action_type = core.ActionType.POOL_SWAP_IN.value
+        address_field = "trader"
+    elif action_kind == "swap_out":
+        action_type = core.ActionType.POOL_SWAP_OUT.value
+        address_field = "trader"
+    else:
+        raise HTTPException(status_code=400, detail=f"unsupported signed intent action: {action_kind}")
+
+    terms = proposal.get("terms") or {}
+    return {
+        "type": action_type,
+        "sender_vk": intent["signer_vk"],
+        "nonce": int(intent["nonce"]),
+        "asset_id": str(asset_ref["asset_id"]),
+        "bundle_id": str(terms["bundle_id"]),
+        "pool_id": str(payload["pool_id"]),
+        "leg_id": str(payload["leg_id"]),
+        address_field: str(payload["address"]),
+        "amount": int(payload["amount"]),
+    }
+
+
+def _execution_actions_by_layer(
+    proposal: dict[str, Any],
+    signed_intents: list[dict[str, Any]],
+) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for intent in signed_intents:
+        asset_ref = intent.get("asset_ref")
+        if not asset_ref:
+            raise HTTPException(status_code=400, detail="signed intent missing asset_ref")
+        key = (str(asset_ref["sl_id"]), str(asset_ref["version"]))
+        grouped.setdefault(key, []).append({
+            "intent": intent,
+            "action": _pool_action_from_intent(intent, proposal),
+        })
+    return grouped
+
+
 def _queue_action(
     action: dict,
     sl_id: Optional[str] = None,
@@ -862,6 +1092,268 @@ def _batch_for_submission(
         if int(batch["sequence"]) == sequence:
             return batch
     raise HTTPException(status_code=404, detail=f"operator batch {sequence} not found")
+
+
+def _commit_operator_action_batch(
+    *,
+    actions: list[dict[str, Any]],
+    context: Any,
+    sl_id: str,
+    version: str,
+    source: str,
+    proposal_id: Optional[str] = None,
+) -> dict:
+    checkpoint_status = _require_operator_checkpoint_current(sl_id, version)
+    state = _operator_state(sl_id, version)
+    sequence = STORE.next_batch_sequence(sl_id, version)
+    core_actions = [core.Action.from_dict(action) for action in actions]
+    new_state, result = core.process_batch(
+        state,
+        core_actions,
+        sequence=sequence,
+        sl_id=bytes.fromhex(sl_id),
+        version=bytes.fromhex(version),
+        context=context,
+    )
+    if result.rejected:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "operator rejected one or more execution-request actions",
+                "rejected": [
+                    {
+                        "index": idx,
+                        "error": err,
+                        "action": actions[idx],
+                    }
+                    for idx, err in result.rejected
+                ],
+                "sl_id": sl_id,
+                "version": version,
+            },
+        )
+
+    payload = result.data_field_payload()
+    payload_hex = payload.hex()
+    data_scalars = payload_bytes_to_scalar_hex(payload)
+    submitted = [
+        {
+            "index": idx,
+            "status": "applied",
+            "action": action,
+            "error": None,
+        }
+        for idx, action in enumerate(actions)
+    ]
+    record = {
+        "status": "batched",
+        "source": source,
+        "proposal_id": proposal_id,
+        "sequence": result.sequence,
+        "action_count": result.action_count,
+        "applied": result.applied,
+        "rejected": [],
+        "submitted": submitted,
+        "prev_state": state.to_dict(),
+        "prev_state_hash": result.prev_state_hash,
+        "new_state_hash": result.new_state_hash,
+        "actions_applied": [action.to_dict() for action in result.actions],
+        "payload_hex": payload_hex,
+        "payload_size": len(payload),
+        "data_scalars": data_scalars,
+        "data_len": len(data_scalars),
+        "sl_id": sl_id,
+        "version": version,
+    }
+    STORE.commit_operator_batch(
+        new_state,
+        record,
+        sequence,
+        sl_id,
+        version,
+        clear_pending=False,
+    )
+    return {
+        "batch": record,
+        "operator_state": _state_to_response(new_state),
+        "operator_checkpoint": checkpoint_status,
+        "sl_id": sl_id,
+        "version": version,
+    }
+
+
+def _preflight_operator_action_batch(
+    *,
+    actions: list[dict[str, Any]],
+    context: Any,
+    sl_id: str,
+    version: str,
+) -> None:
+    _require_operator_checkpoint_current(sl_id, version)
+    state = _operator_state(sl_id, version)
+    sequence = STORE.next_batch_sequence(sl_id, version)
+    core_actions = [core.Action.from_dict(action) for action in actions]
+    _new_state, result = core.process_batch(
+        state,
+        core_actions,
+        sequence=sequence,
+        sl_id=bytes.fromhex(sl_id),
+        version=bytes.fromhex(version),
+        context=context,
+    )
+    if result.rejected:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "operator preflight rejected one or more execution-request actions",
+                "rejected": [
+                    {
+                        "index": idx,
+                        "error": err,
+                        "action": actions[idx],
+                    }
+                    for idx, err in result.rejected
+                ],
+                "sl_id": sl_id,
+                "version": version,
+            },
+        )
+
+
+def _submit_operator_batch_to_devnet(
+    *,
+    batch: dict,
+    sl_id: str,
+    version: str,
+    force: bool = False,
+) -> tuple[dict, dict]:
+    existing = batch.get("devnet_submission")
+    if existing and existing.get("status") == "submitted" and not force:
+        raise HTTPException(
+            status_code=409,
+            detail=f"batch {batch['sequence']} is already submitted to devnet; pass force=true to resubmit",
+        )
+
+    try:
+        status = _devnet_runtime_status(sl_id, version)
+        if not status["ready"]:
+            submitter_error = status.get("submitter_error")
+            if submitter_error:
+                raise DevnetSubmitError(
+                    f"EON devnet submitter is misconfigured: {submitter_error}"
+                )
+            if not status.get("submitter_configured"):
+                raise DevnetSubmitError(
+                    "EON devnet submission is not configured. Set BASE_LAYER_API_URL "
+                    "to the iovi-api service or configure legacy EON_DEVNET_SUBMIT_CMD."
+                )
+            if (
+                status.get("active_base_layer_account_id")
+                and not status.get("account_vault_configured")
+                and not status.get("wallet_file_configured")
+            ):
+                raise DevnetSubmitError(
+                    "EON_KEY_ENCRYPTION_SECRET is required to decrypt the bound "
+                    "base-layer account"
+                )
+            raise DevnetSubmitError(
+                "active semantic layer has no bound base-layer account; register one "
+                "or configure legacy EON_OPERATOR_WALLET_FILE"
+            )
+
+        submission = submit_batch_to_devnet(batch, _submission_account_json(sl_id, version))
+        updated_batch = STORE.record_devnet_submission(
+            batch["sequence"],
+            submission,
+            sl_id,
+            version,
+        )
+    except DevnetSubmitError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return submission, updated_batch
+
+
+def _verify_submitted_operator_batch(
+    *,
+    batch: dict,
+    submission: dict,
+    sl_id: str,
+    version: str,
+    wait_for_verifier: bool,
+    timeout_seconds: int,
+    poll_interval_seconds: float,
+) -> tuple[Optional[dict], dict]:
+    updated_batch = batch
+    verification = None
+    if wait_for_verifier and _base_layer_api_url():
+        verification = _sync_verifier_from_base_layer_api(
+            sl_id,
+            version,
+            posting_owner=submission.get("owner"),
+            expected_sequence=int(updated_batch["sequence"]),
+            expected_state_hash=str(updated_batch["new_state_hash"]),
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+        try:
+            updated_batch = STORE.record_batch_verification(
+                int(updated_batch["sequence"]),
+                verification,
+                sl_id,
+                version,
+            )
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+    elif wait_for_verifier:
+        verification = {
+            "status": "skipped",
+            "verified": False,
+            "message": "BASE_LAYER_API_URL is not configured for verifier sync",
+        }
+    return verification, updated_batch
+
+
+def _receipt_for_action(
+    *,
+    proposal_id: str,
+    signed_intent: dict[str, Any],
+    action: dict[str, Any],
+    batch: dict,
+    verification: Optional[dict],
+    submission: Optional[dict],
+    evidence: dict,
+) -> dict:
+    asset_ref = signed_intent["asset_ref"]
+    address = action.get("owner") or action.get("trader")
+    accepted = bool(batch.get("verified") and verification and verification.get("verified"))
+    return {
+        "proposal_id": proposal_id,
+        "status": "accepted" if accepted else "submitted",
+        "accepted": accepted,
+        "action": signed_intent["action"],
+        "sl_id": asset_ref["sl_id"],
+        "version": asset_ref["version"],
+        "asset_id": asset_ref["asset_id"],
+        "pool_id": action.get("pool_id"),
+        "leg_id": action.get("leg_id"),
+        "address": address,
+        "amount": int(action.get("amount") or 0),
+        "signer": signed_intent["signer"],
+        "nonce": int(signed_intent["nonce"]),
+        "bundle_id": action.get("bundle_id"),
+        "sequence": batch.get("sequence"),
+        "state_hash": batch.get("new_state_hash"),
+        "payload_hex": batch.get("payload_hex"),
+        "data_scalars": batch.get("data_scalars") or [],
+        "base_event_key": evidence.get("event_key"),
+        "utxo_id": evidence.get("utxo_id") or (submission or {}).get("utxo_id"),
+        "tx_hash": evidence.get("verification_tx_hash") or (submission or {}).get("tx_hash"),
+        "output_index": evidence.get("verification_output_index") or (submission or {}).get("output_index"),
+        "devnet_backed": bool(evidence.get("devnet_backed")),
+        "verification": verification,
+    }
 
 
 def _batch_envelope(batch: dict) -> dict:
@@ -2304,6 +2796,110 @@ def operator_batch(
         }
 
 
+@app.post("/operator/execution-request")
+def operator_execution_request(request: OperatorExecutionRequest) -> dict:
+    proposal = request.proposal or {}
+    if not proposal:
+        raise HTTPException(status_code=400, detail="execution request requires proposal")
+    signed_intents = _validate_execution_signed_intents(request)
+    context = _execution_context_from_proposal(proposal)
+    grouped = _execution_actions_by_layer(proposal, signed_intents)
+    submitted_groups = []
+
+    with STATE_LOCK:
+        for (sl_id, version), pairs in grouped.items():
+            _preflight_operator_action_batch(
+                actions=[pair["action"] for pair in pairs],
+                context=context,
+                sl_id=sl_id,
+                version=version,
+            )
+        for (sl_id, version), pairs in grouped.items():
+            actions = [pair["action"] for pair in pairs]
+            committed = _commit_operator_action_batch(
+                actions=actions,
+                context=context,
+                sl_id=sl_id,
+                version=version,
+                source="operator_execution_request",
+                proposal_id=request.proposal_id,
+            )
+            batch = committed["batch"]
+            submission = None
+            if request.submit_to_base:
+                submission, batch = _submit_operator_batch_to_devnet(
+                    batch=batch,
+                    sl_id=sl_id,
+                    version=version,
+                )
+            submitted_groups.append({
+                **committed,
+                "batch": batch,
+                "submission": submission,
+                "pairs": pairs,
+            })
+
+    receipts = []
+    groups = []
+    for group in submitted_groups:
+        sl_id = group["sl_id"]
+        version = group["version"]
+        submission = group.get("submission")
+        batch = group["batch"]
+        verification = None
+        if submission is not None:
+            verification, batch = _verify_submitted_operator_batch(
+                batch=batch,
+                submission=submission,
+                sl_id=sl_id,
+                version=version,
+                wait_for_verifier=request.wait_for_verifier,
+                timeout_seconds=request.verifier_timeout_seconds,
+                poll_interval_seconds=request.verifier_poll_interval_seconds,
+            )
+        elif request.wait_for_verifier:
+            verification = {
+                "status": "skipped",
+                "verified": False,
+                "message": "submit_to_base=false; verifier sync was not attempted",
+            }
+
+        evidence_batch = _batch_with_evidence(
+            batch,
+            _accepted_log_by_sequence(sl_id, version),
+        )
+        group_receipts = [
+            _receipt_for_action(
+                proposal_id=request.proposal_id,
+                signed_intent=pair["intent"],
+                action=pair["action"],
+                batch=evidence_batch,
+                verification=verification,
+                submission=submission,
+                evidence=evidence_batch,
+            )
+            for pair in group["pairs"]
+        ]
+        receipts.extend(group_receipts)
+        groups.append({
+            "sl_id": sl_id,
+            "version": version,
+            "batch": evidence_batch,
+            "devnet_submission": submission,
+            "verification": verification,
+            "receipts": group_receipts,
+        })
+
+    all_accepted = bool(receipts) and all(receipt.get("accepted") for receipt in receipts)
+    return {
+        "status": "verified" if all_accepted else "submitted",
+        "proposal_id": request.proposal_id,
+        "receipt_count": len(receipts),
+        "receipts": receipts,
+        "groups": groups,
+    }
+
+
 @app.post("/operator/sync-from-verifier")
 def operator_sync_from_verifier(request: LayerRequest) -> dict:
     with STATE_LOCK:
@@ -2402,78 +2998,22 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
     with STATE_LOCK:
         sl_id, version = _layer_hex(request.sl_id, request.version)
         batch = _batch_for_submission(sl_id, version, request.sequence)
-        existing = batch.get("devnet_submission")
-        if existing and existing.get("status") == "submitted" and not request.force:
-            raise HTTPException(
-                status_code=409,
-                detail=f"batch {batch['sequence']} is already submitted to devnet; pass force=true to resubmit",
-            )
-
-        try:
-            status = _devnet_runtime_status(sl_id, version)
-            if not status["ready"]:
-                submitter_error = status.get("submitter_error")
-                if submitter_error:
-                    raise DevnetSubmitError(
-                        f"EON devnet submitter is misconfigured: {submitter_error}"
-                    )
-                if not status.get("submitter_configured"):
-                    raise DevnetSubmitError(
-                        "EON devnet submission is not configured. Set BASE_LAYER_API_URL "
-                        "to the iovi-api service or configure legacy EON_DEVNET_SUBMIT_CMD."
-                    )
-                if (
-                    status.get("active_base_layer_account_id")
-                    and not status.get("account_vault_configured")
-                    and not status.get("wallet_file_configured")
-                ):
-                    raise DevnetSubmitError(
-                        "EON_KEY_ENCRYPTION_SECRET is required to decrypt the bound "
-                        "base-layer account"
-                    )
-                raise DevnetSubmitError(
-                    "active semantic layer has no bound base-layer account; register one "
-                    "or configure legacy EON_OPERATOR_WALLET_FILE"
-                )
-
-            submission = submit_batch_to_devnet(batch, _submission_account_json(sl_id, version))
-            updated_batch = STORE.record_devnet_submission(
-                batch["sequence"],
-                submission,
-                sl_id,
-                version,
-            )
-        except DevnetSubmitError as e:
-            raise HTTPException(status_code=503, detail=str(e)) from e
-        except KeyError as e:
-            raise HTTPException(status_code=404, detail=str(e)) from e
-
-    verification = None
-    if request.wait_for_verifier and _base_layer_api_url():
-        verification = _sync_verifier_from_base_layer_api(
-            sl_id,
-            version,
-            posting_owner=submission.get("owner"),
-            expected_sequence=int(updated_batch["sequence"]),
-            expected_state_hash=str(updated_batch["new_state_hash"]),
-            timeout_seconds=request.verifier_timeout_seconds,
-            poll_interval_seconds=request.verifier_poll_interval_seconds,
+        submission, updated_batch = _submit_operator_batch_to_devnet(
+            batch=batch,
+            sl_id=sl_id,
+            version=version,
+            force=request.force,
         )
-        try:
-            updated_batch = STORE.record_batch_verification(
-                int(updated_batch["sequence"]),
-                verification,
-                sl_id,
-                version,
-            )
-        except KeyError as e:
-            raise HTTPException(status_code=404, detail=str(e)) from e
-    elif request.wait_for_verifier:
-        verification = {
-            "status": "skipped",
-            "verified": False,
-            "message": "BASE_LAYER_API_URL is not configured for verifier sync",
-        }
+
+    verification, updated_batch = _verify_submitted_operator_batch(
+        batch=updated_batch,
+        submission=submission,
+        sl_id=sl_id,
+        version=version,
+        wait_for_verifier=request.wait_for_verifier,
+        timeout_seconds=request.verifier_timeout_seconds,
+        poll_interval_seconds=request.verifier_poll_interval_seconds,
+    )
 
     return {
         "submitted": True,
