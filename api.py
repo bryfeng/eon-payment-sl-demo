@@ -35,7 +35,15 @@ from devnet_submitter import (
 from payment_plugin import PAYMENT_PLUGIN, PaymentSLPlugin, payment_plugin_for
 from storage import DEFAULT_DB_PATH, SQLiteStorage
 from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore
-from verifier_engine.eon_data import ScalarFramingError, payload_bytes_to_scalar_hex
+from verifier_engine.eon_data import (
+    BUNDLE_SL_ID,
+    ScalarFramingError,
+    decode_bundle_payload,
+    decode_transition_payload,
+    payload_header,
+    scalar_hex_to_payload_bytes,
+    payload_bytes_to_scalar_hex,
+)
 from verifier_engine.sources import BaseLayerAPIEventSource
 
 
@@ -181,6 +189,7 @@ class VerifierSyncRequest(BaseModel):
 class VerifierNotifyRequest(BaseModel):
     proposal_id: Optional[str] = None
     source_event: Optional[Dict[str, Any]] = None
+    source_events: list[Dict[str, Any]] = Field(default_factory=list)
     signed_intent_count: Optional[int] = None
     mode: Optional[str] = None
 
@@ -1266,16 +1275,108 @@ def _sync_all_verifier_layers_once() -> dict:
     }
 
 
-def _notify_verifier_from_source_event(source_event: Optional[Dict[str, Any]]) -> dict:
-    if not source_event:
+def _notify_payload_sequence(event: Dict[str, Any]) -> int:
+    data_scalars = event.get("data") or event.get("data_scalars") or []
+    try:
+        payload = scalar_hex_to_payload_bytes(data_scalars)
+    except Exception:
+        return 2**63 - 1
+    if len(payload) < 14:
+        return 2**63 - 1
+    sl_id, _version = payload_header(payload)
+    if sl_id == BUNDLE_SL_ID:
+        sequences: list[int] = []
+        try:
+            bundle = decode_bundle_payload(payload)
+        except Exception:
+            return 2**63 - 1
+        for child in bundle.children:
+            try:
+                sequences.append(decode_transition_payload(child).sequence)
+            except Exception:
+                continue
+        return min(sequences) if sequences else 2**63 - 1
+    return int.from_bytes(payload[6:14], "big")
+
+
+def _notify_event_sort_key(event: Dict[str, Any]) -> tuple[int, int, int, int, str]:
+    return (
+        int(event.get("height", 0)),
+        int(event.get("tx_index", 0)),
+        _notify_payload_sequence(event),
+        int(event.get("output_index", 0)),
+        str(event.get("event_key") or event.get("utxo_id") or event.get("tx_hash") or ""),
+    )
+
+
+def _event_matches_hint(event: Dict[str, Any], hint: Optional[Dict[str, Any]]) -> bool:
+    if not hint:
+        return False
+
+    event_key = str(event.get("event_key") or "")
+    hint_event_key = str(hint.get("event_key") or "")
+    if event_key and hint_event_key and event_key == hint_event_key:
+        return True
+
+    event_data = event.get("data") or event.get("data_scalars") or []
+    hint_data = hint.get("data") or hint.get("data_scalars") or []
+    if not isinstance(event_data, list) or not isinstance(hint_data, list):
+        return False
+    if [str(item) for item in event_data] != [str(item) for item in hint_data]:
+        return False
+
+    event_tx = str(event.get("tx_hash") or event.get("transaction_hash") or "")
+    hint_tx = str(hint.get("tx_hash") or hint.get("transaction_hash") or "")
+    event_utxo = str(event.get("utxo_id") or "")
+    hint_utxo = str(hint.get("utxo_id") or hint.get("id") or "")
+    return not hint_tx or event_tx == hint_tx or event_utxo == hint_tx or event_utxo == hint_utxo
+
+
+def _sync_supplied_notify_events(
+    source_events: list[Dict[str, Any]],
+    source_event: Optional[Dict[str, Any]],
+) -> tuple[dict, Optional[Dict[str, Any]]]:
+    if not source_events:
+        return {"events": []}, None
+
+    deduped: dict[str, Dict[str, Any]] = {}
+    target_event: Optional[Dict[str, Any]] = None
+    for event in source_events:
+        if not isinstance(event, dict):
+            continue
+        key = str(event.get("event_key") or event.get("cursor") or event.get("utxo_id") or event.get("tx_hash") or len(deduped))
+        deduped[key] = event
+        if target_event is None and _event_matches_hint(event, source_event):
+            target_event = event
+
+    results = []
+    for event in sorted(deduped.values(), key=_notify_event_sort_key):
+        results.append(_verifier_engine().ingest_event(event, retry_rejected=True))
+
+    return {
+        "source": "supplied-source-events",
+        "previous_cursor": None,
+        "latest_cursor": None,
+        "events": results,
+    }, target_event
+
+
+def _notify_verifier_from_source_event(
+    source_event: Optional[Dict[str, Any]],
+    source_events: Optional[list[Dict[str, Any]]] = None,
+) -> dict:
+    if not source_event and not source_events:
         return _sync_all_verifier_layers_once()
 
     base_url = _base_layer_api_url()
-    owner = source_event.get("owner")
+    owner = source_event.get("owner") if source_event else None
     target_event: Dict[str, Any] | None = None
     sync_result: dict = {"events": []}
 
-    if base_url and owner:
+    if source_events:
+        sync_result, target_event = _sync_supplied_notify_events(source_events, source_event)
+
+    if not source_events and base_url and owner:
         source = BaseLayerAPIEventSource(
             base_url,
             owner=str(owner),
@@ -1294,7 +1395,7 @@ def _notify_verifier_from_source_event(source_event: Optional[Dict[str, Any]]) -
             retry_rejected=True,
         )
 
-    if target_event is None:
+    if target_event is None and source_event is not None:
         target_event = dict(source_event)
 
     target_key = str(target_event.get("event_key") or "")
@@ -1304,8 +1405,10 @@ def _notify_verifier_from_source_event(source_event: Optional[Dict[str, Any]]) -
     ]
     if matching_results:
         target_result = matching_results[-1]
-    else:
+    elif target_event is not None:
         target_result = _verifier_engine().ingest_event(target_event, retry_rejected=True)
+    else:
+        target_result = {"accepted": False, "ignored": True, "message": "no target event supplied"}
 
     target_accepted = bool(target_result.get("accepted"))
     if target_key and not target_accepted:
@@ -1329,6 +1432,7 @@ def _notify_verifier_from_source_event(source_event: Optional[Dict[str, Any]]) -
         "target_event": target_event,
         "target_result": target_result,
         "sync_result": sync_result,
+        "source_event_count": len(source_events or []),
     }
 
 
@@ -2326,7 +2430,7 @@ def verifier_sync(request: VerifierSyncRequest) -> dict:
 @app.post("/verifier/notify")
 def verifier_notify(request: VerifierNotifyRequest) -> dict:
     with STATE_LOCK:
-        return _notify_verifier_from_source_event(request.source_event)
+        return _notify_verifier_from_source_event(request.source_event, request.source_events)
 
 
 @app.post("/verifier/index")

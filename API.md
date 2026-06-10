@@ -406,9 +406,9 @@ expected sequence/hash, otherwise `status: "timeout"`. A timeout means the
 base-layer post may still exist, but this verifier has not observed and accepted
 it yet.
 
-`POST /verifier/notify` accepts a base event hint, resolves it against the
-owner-scoped UTXO stream when the base-layer API is configured, catches up that
-stream in order, and reports whether the target event was accepted:
+`POST /verifier/notify` accepts a base event hint, optionally replays a supplied
+base-event history in decoded sequence order, and reports whether the target
+event was accepted:
 
 ```json
 {
@@ -419,6 +419,16 @@ stream in order, and reports whether the target event was accepted:
     "owner": "0x64_hex_chars",
     "data_scalars": ["0x..."]
   },
+  "source_events": [
+    {
+      "cursor": "devnet:utxo:0x...",
+      "event_key": "devnet:utxo:0x...:0",
+      "network_id": "devnet",
+      "tx_hash": "0x...",
+      "owner": "0x64_hex_chars",
+      "data_scalars": ["0x..."]
+    }
+  ],
   "signed_intent_count": 2,
   "mode": "marketplace-execution"
 }
@@ -426,7 +436,10 @@ stream in order, and reports whether the target event was accepted:
 
 This is the notification bridge used by marketplace-style coordinators after a
 bundle is posted to base. The verifier still derives accepted state by replaying
-base UTXO data; the hint only narrows discovery to the relevant owner stream.
+base event payloads; the hint only narrows discovery to the relevant event.
+`source_events` is useful when the caller has an accepted verifier event log.
+If omitted, the service falls back to the configured owner-scoped base UTXO
+surface, which may not include spent historical data.
 
 `POST /verifier/index` runs one base-layer indexing pass across all initialized
 semantic layers. It uses the same verifier/indexer path as `/verifier/sync`, but

@@ -1147,6 +1147,52 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["state"]["total_supply"], 150)
 
+    def test_verifier_notify_replays_supplied_history_in_sequence_order(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        batches = []
+
+        for amount in [100, 50, 25, 10]:
+            self.client.post(
+                "/actions/mint",
+                json={"to_address": alice["address"], "amount": amount},
+            )
+            batch_response = self.client.post("/operator/batch")
+            self.assertEqual(batch_response.status_code, 200, batch_response.text)
+            batches.append(batch_response.json()["batch"])
+
+        def event_for(batch, index):
+            return {
+                "cursor": f"devnet:utxo:0xhistory{index}:0",
+                "event_key": f"devnet:utxo:0xhistory{index}:0",
+                "network_id": "devnet",
+                "tx_hash": f"0xtx{index}",
+                "output_index": 0,
+                "utxo_id": f"0xhistory{index}",
+                "owner": "0xposter",
+                "amount": str(batch["data_len"]),
+                "data_scalars": batch["data_scalars"],
+            }
+
+        events = [event_for(batch, index + 1) for index, batch in enumerate(batches)]
+        response = self.client.post(
+            "/verifier/notify",
+            json={
+                "source_event": events[3],
+                "source_events": [events[3], events[2], events[0], events[1]],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["accepted"], body)
+        self.assertEqual(body["target_event"]["event_key"], events[3]["event_key"])
+        self.assertEqual(body["target_result"]["sequence"], 4)
+        self.assertEqual(body["accepted_count"], 4)
+
+        response = self.client.get(f"/verifier/state?sl_id={SL_ID.hex()}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["state"]["total_supply"], 185)
+
     def test_devnet_submission_requires_configured_submitter(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")
