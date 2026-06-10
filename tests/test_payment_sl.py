@@ -695,6 +695,37 @@ class PaymentSLTests(unittest.TestCase):
         self.assertEqual(verified_usdc.get_balance(provider, "USDC"), 1_800)
         self.assertEqual(verified_usdc.get_pool_escrow(pool_id, "USDC"), 200)
 
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VerifierStore(Path(tmp) / "verifier.sqlite")
+            engine = VerifierEngine(
+                store,
+                PluginRegistry([spx_plugin, usdc_plugin]),
+                {
+                    spx_plugin.sl_id.hex(): {"issuer_vk": "spx_issuer"},
+                    usdc_plugin.sl_id.hex(): {"issuer_vk": "usdc_issuer"},
+                },
+            )
+
+            self.assertTrue(engine.ingest_event(event_for_payload(spx_seed, "spxseed-payment-only"))["accepted"])
+            self.assertTrue(engine.ingest_event(event_for_payload(usdc_seed, "usdcseed-payment-only"))["accepted"])
+            payment_only_result = engine.ingest_event(
+                event_for_payload(liquidity_bundle, "liquidity-payment-only", 3)
+            )
+            payment_only_spx_checkpoint = store.load_checkpoint(spx_plugin.sl_id, version)
+            payment_only_usdc_checkpoint = store.load_checkpoint(usdc_plugin.sl_id, version)
+            payment_only_amm_checkpoint = store.load_checkpoint(amm_plugin.sl_id, version)
+            payment_only_settlement_checkpoint = store.load_checkpoint(settlement_plugin.sl_id, version)
+
+        self.assertTrue(payment_only_result["accepted"], payment_only_result)
+        self.assertEqual({child["sl_id"] for child in payment_only_result["children"]}, {
+            spx_plugin.sl_id.hex(),
+            usdc_plugin.sl_id.hex(),
+        })
+        self.assertEqual(payment_only_spx_checkpoint["state_hash"], spx_next.state_hash())
+        self.assertEqual(payment_only_usdc_checkpoint["state_hash"], usdc_next.state_hash())
+        self.assertIsNone(payment_only_amm_checkpoint)
+        self.assertIsNone(payment_only_settlement_checkpoint)
+
     def test_engine_defers_future_sequence_without_poisoning_event(self):
         issuer = "issuer_vk"
         alice = hash_vk("alice_vk")

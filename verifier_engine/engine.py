@@ -6,6 +6,7 @@ from .eon_data import (
     BUNDLE_SL_ID,
     BUNDLE_VERSION,
     decode_bundle_payload,
+    decode_transition_payload,
     payload_header,
     payload_hex_to_bytes,
     scalar_hex_to_payload_bytes,
@@ -190,21 +191,44 @@ class VerifierEngine:
             "state_hash": state_hash,
         }
 
-    def _parse_registered_bundle_children(self, children: list[bytes]) -> list[dict]:
+    def _generic_transition(self, child: bytes) -> dict:
+        decoded = decode_transition_payload(child)
+        return {
+            "sl_id": decoded.sl_id.hex(),
+            "version": decoded.version.hex(),
+            "sequence": decoded.sequence,
+            "prev_state_hash": decoded.prev_state_hash,
+            "new_state_hash": decoded.new_state_hash,
+            "actions": decoded.actions,
+            "payload_hex": decoded.payload_hex,
+        }
+
+    def _parse_registered_bundle_children(self, children: list[bytes]) -> tuple[list[dict], list[dict]]:
         parsed = []
+        context_transitions = []
         for child in children:
             sl_id, version = payload_header(child)
             plugin = self.registry.get(sl_id, version)
+            context_transition = None
+            try:
+                context_transition = self._generic_transition(child)
+                context_transitions.append(context_transition)
+            except Exception:
+                if plugin is None:
+                    continue
+
             if plugin is None:
                 continue
             transition = plugin.parse_payload(child)
+            if context_transition is None:
+                context_transitions.append(self._context_transition(transition))
             parsed.append({
                 "sl_id": sl_id,
                 "version": version,
                 "plugin": plugin,
                 "transition": transition,
             })
-        return parsed
+        return parsed, context_transitions
 
     def _bundle_rejection_result(
         self,
@@ -258,7 +282,7 @@ class VerifierEngine:
 
         try:
             bundle = decode_bundle_payload(payload)
-            parsed = self._parse_registered_bundle_children(bundle.children)
+            parsed, child_transitions = self._parse_registered_bundle_children(bundle.children)
         except Exception as e:
             if not exists:
                 event_key, _inserted = self.store.append_base_event(event)
@@ -289,7 +313,6 @@ class VerifierEngine:
                 "message": "bundle has no registered semantic-layer children",
             }
 
-        child_transitions = [self._context_transition(child["transition"]) for child in parsed]
         context = SimpleNamespace(
             bundle_id=bundle.bundle_id,
             child_transitions=child_transitions,
