@@ -110,6 +110,7 @@ GET /verifier/state
 GET /verifier/log
 GET /verifier/events
 POST /verifier/sync
+POST /verifier/index
 POST /verifier/accept-latest-batch
 POST /verifier/accept-envelope
 POST /verifier/envelope-from-payload
@@ -358,6 +359,7 @@ GET /verifier/state
 GET /verifier/log
 GET /verifier/events
 POST /verifier/sync
+POST /verifier/index
 POST /verifier/ingest-event
 ```
 
@@ -401,6 +403,11 @@ It returns `status: "verified"` when the verifier checkpoint reaches the
 expected sequence/hash, otherwise `status: "timeout"`. A timeout means the
 base-layer post may still exist, but this verifier has not observed and accepted
 it yet.
+
+`POST /verifier/index` runs one base-layer indexing pass across all initialized
+semantic layers. It uses the same verifier/indexer path as `/verifier/sync`, but
+does not wait for one expected checkpoint. Hosted deployments can also run this
+continuously with `EON_VERIFIER_POLL_ENABLED=true`.
 
 `POST /verifier/ingest-event` accepts a normalized EON data-output event. It is
 the verifier/indexer boundary used by direct event ingestion and live UTXO sync:

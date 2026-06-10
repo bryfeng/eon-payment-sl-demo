@@ -56,7 +56,7 @@ class BaseLayerAPIEventSource:
         self.timeout_seconds = timeout_seconds
 
     def events_after(self, cursor: str | None = None) -> Iterable[dict]:
-        del cursor
+        cursor_key = self._cursor_sort_key(cursor)
         for index, utxo in enumerate(self._sorted_utxos()):
             data_scalars = utxo.get("data") or utxo.get("data_scalars") or []
             if not data_scalars:
@@ -69,8 +69,12 @@ class BaseLayerAPIEventSource:
             owner = utxo.get("owner")
             tx_hash = str(utxo.get("tx_hash") or utxo.get("transaction_hash") or utxo_id)
             output_index = int(utxo.get("output_index", index))
+            event_cursor = self._event_cursor(utxo, utxo_id, output_index)
+            event_cursor_key = self._cursor_sort_key(event_cursor)
+            if cursor_key is not None and event_cursor_key is not None and event_cursor_key <= cursor_key:
+                continue
             yield {
-                "cursor": f"{self.network_id}:utxo:{utxo_id}:{output_index}",
+                "cursor": event_cursor,
                 "event_key": f"{self.network_id}:utxo:{utxo_id}:{output_index}",
                 "network_id": self.network_id,
                 "height": int(utxo.get("height", 0)),
@@ -110,10 +114,40 @@ class BaseLayerAPIEventSource:
         return sorted(
             self._utxos(),
             key=lambda utxo: (
+                int(utxo.get("height", 0)),
+                int(utxo.get("tx_index", 0)),
+                int(utxo.get("output_index", 0)),
                 self._payload_sequence(utxo),
                 str(utxo.get("id") or utxo.get("utxo_id") or ""),
             ),
         )
+
+    def _event_cursor(self, utxo: dict, utxo_id: str, output_index: int) -> str:
+        return ":".join([
+            self.network_id,
+            f"{int(utxo.get('height', 0)):020d}",
+            f"{int(utxo.get('tx_index', 0)):010d}",
+            f"{int(output_index):010d}",
+            f"{self._payload_sequence(utxo):020d}",
+            utxo_id,
+        ])
+
+    def _cursor_sort_key(self, cursor: str | None) -> tuple[int, int, int, int, str] | None:
+        if not cursor:
+            return None
+        parts = str(cursor).split(":", 5)
+        if len(parts) != 6:
+            return None
+        try:
+            return (
+                int(parts[1]),
+                int(parts[2]),
+                int(parts[3]),
+                int(parts[4]),
+                parts[5],
+            )
+        except ValueError:
+            return None
 
     def _payload_sequence(self, utxo: dict) -> int:
         data_scalars = utxo.get("data") or utxo.get("data_scalars") or []

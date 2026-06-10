@@ -9,9 +9,8 @@ can be hosted on a persistent Railway volume.
 import os
 import sqlite3
 import re
-import sys
 import time
-from threading import RLock
+from threading import Event, RLock, Thread
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 from uuid import uuid4
@@ -39,25 +38,11 @@ from verifier_engine import PluginRegistry, VerifierEngine, VerifierStore
 from verifier_engine.eon_data import ScalarFramingError, payload_bytes_to_scalar_hex
 from verifier_engine.sources import BaseLayerAPIEventSource
 
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "eon-marketplace-stack" / "packages"
-for _package in ("eon-protocol-schemas", "eon-amm-framework", "eon-settlement-framework"):
-    _package_path = _PACKAGE_ROOT / _package
-    if _package_path.exists() and str(_package_path) not in sys.path:
-        sys.path.append(str(_package_path))
-
-try:
-    from eon_amm import AMMPlugin
-except ModuleNotFoundError:
-    AMMPlugin = None
-
-try:
-    from eon_settlement import SettlementPlugin
-except ModuleNotFoundError:
-    SettlementPlugin = None
-
 
 STATE_LOCK = RLock()
 STORE = SQLiteStorage(DEFAULT_DB_PATH)
+VERIFIER_POLL_STOP = Event()
+VERIFIER_POLL_THREAD: Optional[Thread] = None
 
 
 app = FastAPI(
@@ -570,16 +555,6 @@ def _verifier_engine() -> VerifierEngine:
     plugins_by_key: dict[tuple[str, str], Any] = {
         (PAYMENT_PLUGIN.sl_id.hex(), core.VERSION.hex()): PAYMENT_PLUGIN
     }
-    if AMMPlugin is not None:
-        amm_sl_id = _sl_id_bytes(os.environ.get("AMM_SL_ID", "00040001"))
-        amm_version = bytes.fromhex(_version_hex(os.environ.get("AMM_VERSION", core.VERSION.hex())))
-        amm_plugin = AMMPlugin(amm_sl_id, amm_version)
-        plugins_by_key[(amm_sl_id.hex(), amm_version.hex())] = amm_plugin
-    if SettlementPlugin is not None:
-        settlement_sl_id = _sl_id_bytes(os.environ.get("SETTLEMENT_SL_ID", "00030001"))
-        settlement_version = bytes.fromhex(_version_hex(os.environ.get("SETTLEMENT_VERSION", core.VERSION.hex())))
-        settlement_plugin = SettlementPlugin(settlement_sl_id, settlement_version)
-        plugins_by_key[(settlement_sl_id.hex(), settlement_version.hex())] = settlement_plugin
     for runtime in STORE.list_runtime_configs():
         sl_id_hex = str(runtime["sl_id"])
         version_hex = str(runtime["version"])
@@ -1020,6 +995,24 @@ def _base_layer_api_url() -> Optional[str]:
     return None
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _checkpoint_response(sl_id: str, version: str) -> Optional[dict]:
     checkpoint = _verifier_store().load_checkpoint(
         bytes.fromhex(sl_id),
@@ -1219,6 +1212,86 @@ def _sync_verifier_from_base_layer_api(
         "timeout_seconds": timeout_seconds,
         "poll_interval_seconds": poll_interval_seconds,
     }
+
+
+def _sync_all_verifier_layers_once() -> dict:
+    if not _base_layer_api_url():
+        return {
+            "status": "skipped",
+            "message": "BASE_LAYER_API_URL is not configured",
+            "layers": [],
+        }
+
+    layers = STORE.list_runtime_configs()
+    results = []
+    for runtime in layers:
+        sl_id = str(runtime["sl_id"])
+        version = str(runtime["version"])
+        try:
+            result = _sync_verifier_from_base_layer_api(sl_id, version, timeout_seconds=0)
+            updated_batch = _record_verification_for_checkpoint_batch(sl_id, version, result)
+            if updated_batch is not None:
+                result["batch"] = _batch_with_evidence(
+                    updated_batch,
+                    _accepted_log_by_sequence(sl_id, version),
+                )
+        except Exception as e:
+            result = {
+                "status": "error",
+                "verified": False,
+                "sl_id": sl_id,
+                "version": version,
+                "message": str(e),
+            }
+        results.append({"sl_id": sl_id, "version": version, "result": result})
+
+    accepted = sum(
+        attempt.get("accepted", 0)
+        for entry in results
+        for attempt in entry.get("result", {}).get("attempts", [])
+        if isinstance(attempt, dict)
+    )
+    return {
+        "status": "indexed",
+        "layer_count": len(layers),
+        "accepted": accepted,
+        "layers": results,
+    }
+
+
+def _verifier_poll_loop() -> None:
+    interval = _env_float("EON_VERIFIER_POLL_INTERVAL_SECONDS", 5.0)
+    while not VERIFIER_POLL_STOP.wait(interval):
+        try:
+            with STATE_LOCK:
+                _sync_all_verifier_layers_once()
+        except Exception:
+            continue
+
+
+@app.on_event("startup")
+def start_verifier_polling() -> None:
+    global VERIFIER_POLL_THREAD
+    if not _env_bool("EON_VERIFIER_POLL_ENABLED", False):
+        return
+    if not _base_layer_api_url():
+        return
+    if VERIFIER_POLL_THREAD and VERIFIER_POLL_THREAD.is_alive():
+        return
+    VERIFIER_POLL_STOP.clear()
+    VERIFIER_POLL_THREAD = Thread(
+        target=_verifier_poll_loop,
+        name="payment-sl-verifier-poller",
+        daemon=True,
+    )
+    VERIFIER_POLL_THREAD.start()
+
+
+@app.on_event("shutdown")
+def stop_verifier_polling() -> None:
+    VERIFIER_POLL_STOP.set()
+    if VERIFIER_POLL_THREAD and VERIFIER_POLL_THREAD.is_alive():
+        VERIFIER_POLL_THREAD.join(timeout=2)
 
 
 def _record_verification_for_checkpoint_batch(
@@ -2175,6 +2248,12 @@ def verifier_sync(request: VerifierSyncRequest) -> dict:
         return result
     except DevnetSubmitError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post("/verifier/index")
+def verifier_index() -> dict:
+    with STATE_LOCK:
+        return _sync_all_verifier_layers_once()
 
 
 @app.post("/verifier/accept-latest-batch")
