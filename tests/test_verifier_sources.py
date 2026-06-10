@@ -1,4 +1,16 @@
+from verifier_engine.eon_data import encode_bundle_payload, payload_bytes_to_scalar_hex
 from verifier_engine.sources import BaseLayerAPIEventSource
+
+
+def _transition_payload(sl_id_hex: str, sequence: int) -> bytes:
+    return (
+        bytes.fromhex(sl_id_hex)
+        + b"\x00\x01"
+        + int(sequence).to_bytes(8, "big")
+        + (b"\x11" * 32)
+        + (b"\x22" * 32)
+        + (0).to_bytes(2, "big")
+    )
 
 
 def test_base_layer_event_source_filters_after_cursor(monkeypatch):
@@ -82,3 +94,17 @@ def test_base_layer_event_source_resolves_event_hint(monkeypatch):
     assert event["event_key"] == "devnet:utxo:0xtarget:2"
     assert event["owner"] == "0xowner"
     assert event["data_scalars"] == ["0x1", "0x2"]
+
+
+def test_base_layer_event_source_orders_bundle_by_child_sequence():
+    source = BaseLayerAPIEventSource("https://base.example")
+    bundle_payload = encode_bundle_payload(
+        bundle_id="ff" * 32,
+        children=[
+            _transition_payload("00010120", 5),
+            _transition_payload("00010121", 2),
+        ],
+    )
+    utxo = {"data": payload_bytes_to_scalar_hex(bundle_payload)}
+
+    assert source._payload_sequence(utxo) == 2

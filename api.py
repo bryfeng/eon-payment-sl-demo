@@ -1290,7 +1290,7 @@ def _notify_verifier_from_source_event(source_event: Optional[Dict[str, Any]]) -
         )
         sync_result = _verifier_engine().sync_from_source(
             source,
-            f"base-layer-api:notify:{owner}:{target_hint}",
+            f"base-layer-api:notify:v2:{owner}:{target_hint}",
             retry_rejected=True,
         )
 

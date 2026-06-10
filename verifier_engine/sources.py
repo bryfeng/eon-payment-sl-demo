@@ -7,7 +7,13 @@ import urllib.request
 from pathlib import Path
 from typing import Iterable, Protocol
 
-from .eon_data import scalar_hex_to_payload_bytes
+from .eon_data import (
+    BUNDLE_SL_ID,
+    decode_bundle_payload,
+    decode_transition_payload,
+    payload_header,
+    scalar_hex_to_payload_bytes,
+)
 
 
 class EventSource(Protocol):
@@ -166,6 +172,19 @@ class BaseLayerAPIEventSource:
             return 2**63 - 1
         if len(payload) < 14:
             return 2**63 - 1
+        sl_id, _version = payload_header(payload)
+        if sl_id == BUNDLE_SL_ID:
+            sequences = []
+            try:
+                bundle = decode_bundle_payload(payload)
+            except Exception:
+                return 2**63 - 1
+            for child in bundle.children:
+                try:
+                    sequences.append(decode_transition_payload(child).sequence)
+                except Exception:
+                    continue
+            return min(sequences) if sequences else 2**63 - 1
         return int.from_bytes(payload[6:14], "big")
 
     def _event_from_utxo(self, utxo: dict, utxo_id: str, output_index: int) -> dict:
