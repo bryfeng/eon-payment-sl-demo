@@ -178,6 +178,13 @@ class VerifierSyncRequest(BaseModel):
     poll_interval_seconds: float = Field(default=5, gt=0, le=30)
 
 
+class VerifierNotifyRequest(BaseModel):
+    proposal_id: Optional[str] = None
+    source_event: Optional[Dict[str, Any]] = None
+    signed_intent_count: Optional[int] = None
+    mode: Optional[str] = None
+
+
 class BaseEventRequest(BaseModel):
     cursor: str
     network_id: str = "devnet"
@@ -1259,6 +1266,66 @@ def _sync_all_verifier_layers_once() -> dict:
     }
 
 
+def _notify_verifier_from_source_event(source_event: Optional[Dict[str, Any]]) -> dict:
+    if not source_event:
+        return _sync_all_verifier_layers_once()
+
+    base_url = _base_layer_api_url()
+    owner = source_event.get("owner")
+    target_event: Dict[str, Any] | None = None
+    sync_result: dict = {"events": []}
+
+    if base_url and owner:
+        source = BaseLayerAPIEventSource(
+            base_url,
+            owner=str(owner),
+            network_id=str(source_event.get("network_id") or "devnet"),
+        )
+        target_event = source.event_for_hint(source_event)
+        sync_result = _verifier_engine().sync_from_source(
+            source,
+            f"base-layer-api:notify:{owner}",
+            retry_rejected=True,
+        )
+
+    if target_event is None:
+        target_event = dict(source_event)
+
+    target_key = str(target_event.get("event_key") or "")
+    matching_results = [
+        event for event in sync_result.get("events", [])
+        if target_key and event.get("event_key") == target_key
+    ]
+    if matching_results:
+        target_result = matching_results[-1]
+    else:
+        target_result = _verifier_engine().ingest_event(target_event, retry_rejected=True)
+
+    target_accepted = bool(target_result.get("accepted"))
+    if target_key and not target_accepted:
+        target_accepted = _verifier_store().has_accepted_verification(target_key)
+
+    accepted_count = sum(
+        1 for event in sync_result.get("events", [])
+        if isinstance(event, dict) and event.get("accepted")
+    )
+    if target_accepted and not any(
+        target_key and event.get("event_key") == target_key and event.get("accepted")
+        for event in sync_result.get("events", [])
+        if isinstance(event, dict)
+    ):
+        accepted_count += 1
+
+    return {
+        "status": "notified",
+        "accepted": target_accepted,
+        "accepted_count": accepted_count,
+        "target_event": target_event,
+        "target_result": target_result,
+        "sync_result": sync_result,
+    }
+
+
 def _verifier_poll_loop() -> None:
     interval = _env_float("EON_VERIFIER_POLL_INTERVAL_SECONDS", 5.0)
     while not VERIFIER_POLL_STOP.wait(interval):
@@ -2248,6 +2315,12 @@ def verifier_sync(request: VerifierSyncRequest) -> dict:
         return result
     except DevnetSubmitError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
+
+
+@app.post("/verifier/notify")
+def verifier_notify(request: VerifierNotifyRequest) -> dict:
+    with STATE_LOCK:
+        return _notify_verifier_from_source_event(request.source_event)
 
 
 @app.post("/verifier/index")

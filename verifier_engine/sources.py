@@ -2,6 +2,7 @@
 
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Iterable, Protocol
@@ -66,32 +67,40 @@ class BaseLayerAPIEventSource:
             if not utxo_id:
                 continue
 
-            owner = utxo.get("owner")
-            tx_hash = str(utxo.get("tx_hash") or utxo.get("transaction_hash") or utxo_id)
             output_index = int(utxo.get("output_index", index))
             event_cursor = self._event_cursor(utxo, utxo_id, output_index)
             event_cursor_key = self._cursor_sort_key(event_cursor)
             if cursor_key is not None and event_cursor_key is not None and event_cursor_key <= cursor_key:
                 continue
-            yield {
-                "cursor": event_cursor,
-                "event_key": f"{self.network_id}:utxo:{utxo_id}:{output_index}",
-                "network_id": self.network_id,
-                "height": int(utxo.get("height", 0)),
-                "block_hash": utxo.get("block_hash"),
-                "tx_hash": tx_hash,
-                "tx_index": int(utxo.get("tx_index", 0)),
-                "output_index": output_index,
-                "utxo_id": utxo_id,
-                "owner": owner,
-                "amount": str(utxo.get("amount", "0")),
-                "data_scalars": data_scalars,
-            }
+            yield self._event_from_utxo(utxo, utxo_id, output_index)
+
+    def event_for_hint(self, hint: dict) -> dict | None:
+        expected_data = hint.get("data") or hint.get("data_scalars") or []
+        if not isinstance(expected_data, list) or not expected_data:
+            return None
+        expected_data = [str(item) for item in expected_data]
+        expected_tx_hash = str(hint.get("tx_hash") or hint.get("transaction_hash") or "")
+
+        for index, utxo in enumerate(self._sorted_utxos()):
+            data_scalars = utxo.get("data") or utxo.get("data_scalars") or []
+            if [str(item) for item in data_scalars] != expected_data:
+                continue
+
+            utxo_id = str(utxo.get("id") or utxo.get("utxo_id") or "")
+            if not utxo_id:
+                continue
+
+            utxo_tx_hash = str(utxo.get("tx_hash") or utxo.get("transaction_hash") or "")
+            if expected_tx_hash and utxo_tx_hash and utxo_tx_hash != expected_tx_hash:
+                continue
+
+            return self._event_from_utxo(utxo, utxo_id, int(utxo.get("output_index", index)))
+        return None
 
     def _utxos(self) -> list[dict]:
         path = "/utxos"
         if self.owner:
-            path = f"{path}?owner={self.owner}"
+            path = f"{path}?{urllib.parse.urlencode({'owner': self.owner, 'limit': 50})}"
         request = urllib.request.Request(
             f"{self.base_url}{path}",
             headers={"Accept": "application/json"},
@@ -158,3 +167,21 @@ class BaseLayerAPIEventSource:
         if len(payload) < 14:
             return 2**63 - 1
         return int.from_bytes(payload[6:14], "big")
+
+    def _event_from_utxo(self, utxo: dict, utxo_id: str, output_index: int) -> dict:
+        data_scalars = utxo.get("data") or utxo.get("data_scalars") or []
+        tx_hash = str(utxo.get("tx_hash") or utxo.get("transaction_hash") or utxo_id)
+        return {
+            "cursor": self._event_cursor(utxo, utxo_id, output_index),
+            "event_key": f"{self.network_id}:utxo:{utxo_id}:{output_index}",
+            "network_id": self.network_id,
+            "height": int(utxo.get("height", 0)),
+            "block_hash": utxo.get("block_hash"),
+            "tx_hash": tx_hash,
+            "tx_index": int(utxo.get("tx_index", 0)),
+            "output_index": output_index,
+            "utxo_id": utxo_id,
+            "owner": utxo.get("owner"),
+            "amount": str(utxo.get("amount", "0")),
+            "data_scalars": data_scalars,
+        }

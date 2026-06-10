@@ -48,3 +48,37 @@ def test_base_layer_event_source_replays_for_legacy_cursor(monkeypatch):
     events = list(source.events_after("devnet:utxo:0xold:0"))
     assert len(events) == 1
     assert events[0]["event_key"] == "devnet:utxo:0xnew:0"
+
+
+def test_base_layer_event_source_resolves_event_hint(monkeypatch):
+    source = BaseLayerAPIEventSource("https://base.example", owner="0xowner")
+    monkeypatch.setattr(
+        source,
+        "_utxos",
+        lambda: [
+            {
+                "id": "0xother",
+                "tx_hash": "0xother-tx",
+                "output_index": 0,
+                "data": ["0x1", "0x1"],
+            },
+            {
+                "id": "0xtarget",
+                "tx_hash": "0xtarget-tx",
+                "output_index": 2,
+                "owner": "0xowner",
+                "amount": "10",
+                "data": ["0x1", "0x2"],
+            },
+        ],
+    )
+
+    event = source.event_for_hint({
+        "tx_hash": "0xtarget-tx",
+        "data_scalars": ["0x1", "0x2"],
+    })
+
+    assert event is not None
+    assert event["event_key"] == "devnet:utxo:0xtarget:2"
+    assert event["owner"] == "0xowner"
+    assert event["data_scalars"] == ["0x1", "0x2"]

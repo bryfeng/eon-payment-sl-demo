@@ -1084,6 +1084,69 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["batches"][0]["verification_tx_hash"], "0xtx1")
         self.assertTrue(response.json()["batches"][0]["devnet_backed"])
 
+    def test_verifier_notify_catches_up_owner_stream_before_target(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        batch_one_response = self.client.post("/operator/batch")
+        self.assertEqual(batch_one_response.status_code, 200, batch_one_response.text)
+        batch_one = batch_one_response.json()["batch"]
+
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 50},
+        )
+        batch_two_response = self.client.post("/operator/batch")
+        self.assertEqual(batch_two_response.status_code, 200, batch_two_response.text)
+        batch_two = batch_two_response.json()["batch"]
+
+        base_url, calls = self._mock_base_layer_api()
+        calls["utxos"].extend([
+            {
+                "id": "0xutxo1",
+                "tx_hash": "0xtx1",
+                "output_index": 0,
+                "amount": batch_one["data_len"],
+                "owner": "0xposter",
+                "data": batch_one["data_scalars"],
+            },
+            {
+                "id": "0xutxo2",
+                "tx_hash": "0xtx2",
+                "output_index": 1,
+                "amount": batch_two["data_len"],
+                "owner": "0xposter",
+                "data": batch_two["data_scalars"],
+            },
+        ])
+        os.environ["BASE_LAYER_API_URL"] = base_url
+
+        response = self.client.post(
+            "/verifier/notify",
+            json={
+                "source_event": {
+                    "network_id": "devnet",
+                    "tx_hash": "0xtx2",
+                    "owner": "0xposter",
+                    "data_scalars": batch_two["data_scalars"],
+                }
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["accepted"])
+        self.assertEqual(body["target_event"]["event_key"], "devnet:utxo:0xutxo2:1")
+        self.assertEqual(body["target_result"]["sequence"], batch_two["sequence"])
+        self.assertEqual(body["accepted_count"], 2)
+
+        response = self.client.get(f"/verifier/state?sl_id={SL_ID.hex()}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["state"]["total_supply"], 150)
+
     def test_devnet_submission_requires_configured_submitter(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")

@@ -110,6 +110,7 @@ GET /verifier/state
 GET /verifier/log
 GET /verifier/events
 POST /verifier/sync
+POST /verifier/notify
 POST /verifier/index
 POST /verifier/accept-latest-batch
 POST /verifier/accept-envelope
@@ -359,6 +360,7 @@ GET /verifier/state
 GET /verifier/log
 GET /verifier/events
 POST /verifier/sync
+POST /verifier/notify
 POST /verifier/index
 POST /verifier/ingest-event
 ```
@@ -403,6 +405,28 @@ It returns `status: "verified"` when the verifier checkpoint reaches the
 expected sequence/hash, otherwise `status: "timeout"`. A timeout means the
 base-layer post may still exist, but this verifier has not observed and accepted
 it yet.
+
+`POST /verifier/notify` accepts a base event hint, resolves it against the
+owner-scoped UTXO stream when the base-layer API is configured, catches up that
+stream in order, and reports whether the target event was accepted:
+
+```json
+{
+  "proposal_id": "market-proposal-id",
+  "source_event": {
+    "network_id": "devnet",
+    "tx_hash": "0x...",
+    "owner": "0x64_hex_chars",
+    "data_scalars": ["0x..."]
+  },
+  "signed_intent_count": 2,
+  "mode": "marketplace-execution"
+}
+```
+
+This is the notification bridge used by marketplace-style coordinators after a
+bundle is posted to base. The verifier still derives accepted state by replaying
+base UTXO data; the hint only narrows discovery to the relevant owner stream.
 
 `POST /verifier/index` runs one base-layer indexing pass across all initialized
 semantic layers. It uses the same verifier/indexer path as `/verifier/sync`, but
