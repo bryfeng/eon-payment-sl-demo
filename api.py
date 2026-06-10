@@ -683,6 +683,96 @@ def _operator_state_for_layer(
     return state, sl_id_bytes, version_bytes
 
 
+def _operator_checkpoint_status(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> dict:
+    layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    runtime_config = STORE.load_sl_config(layer_sl_id, layer_version)
+    operator_state = STORE.load_operator_state(layer_sl_id, layer_version)
+    operator_next_sequence = (
+        STORE.next_batch_sequence(layer_sl_id, layer_version)
+        if runtime_config is not None
+        else None
+    )
+    checkpoint = _verifier_store().load_checkpoint(
+        bytes.fromhex(layer_sl_id),
+        bytes.fromhex(layer_version),
+    )
+    verifier_sequence = int(checkpoint["sequence"]) if checkpoint is not None else None
+    verifier_state_hash = str(checkpoint["state_hash"]) if checkpoint is not None else None
+    operator_state_hash = operator_state.state_hash() if operator_state is not None else None
+    operator_behind = bool(
+        checkpoint is not None
+        and operator_next_sequence is not None
+        and verifier_sequence is not None
+        and verifier_sequence >= operator_next_sequence
+    )
+    state_hash_mismatch = bool(
+        verifier_state_hash
+        and operator_state_hash
+        and verifier_state_hash != operator_state_hash
+    )
+    operator_last_sequence = (
+        operator_next_sequence - 1
+        if operator_next_sequence is not None
+        else None
+    )
+    operator_conflict = bool(
+        checkpoint is not None
+        and operator_last_sequence is not None
+        and verifier_sequence == operator_last_sequence
+        and state_hash_mismatch
+    )
+    if operator_behind:
+        message = (
+            "operator state is behind verifier checkpoint; sync operator from verifier "
+            "before accepting new semantic-layer actions"
+        )
+    elif operator_conflict:
+        message = (
+            "operator state conflicts with verifier checkpoint at the same sequence; "
+            "sync operator from verifier before accepting new semantic-layer actions"
+        )
+    elif state_hash_mismatch:
+        message = "operator has local state not yet matched by verifier checkpoint"
+    elif checkpoint is not None:
+        message = "operator checkpoint is current with verifier"
+    else:
+        message = "no verifier checkpoint exists yet"
+
+    return {
+        "current": not operator_behind and not operator_conflict,
+        "operator_behind_verifier": operator_behind,
+        "operator_conflicts_verifier": operator_conflict,
+        "state_hash_mismatch": state_hash_mismatch,
+        "operator_next_sequence": operator_next_sequence,
+        "operator_last_sequence": operator_last_sequence,
+        "verifier_sequence": verifier_sequence,
+        "operator_state_hash": operator_state_hash,
+        "verifier_state_hash": verifier_state_hash,
+        "message": message,
+        "sl_id": layer_sl_id,
+        "version": layer_version,
+    }
+
+
+def _require_operator_checkpoint_current(
+    sl_id: Optional[str] = None,
+    version: Optional[str] = None,
+) -> dict:
+    status = _operator_checkpoint_status(sl_id, version)
+    if not status["current"]:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": status["message"],
+                "operator_checkpoint": status,
+            },
+        )
+    return status
+
+
 def _model_to_dict(model: BaseModel) -> dict:
     if hasattr(model, "model_dump"):
         return model.model_dump(exclude_none=True)
@@ -695,6 +785,7 @@ def _queue_action(
     version: Optional[str] = None,
 ) -> dict:
     layer_sl_id, layer_version = _layer_hex(sl_id, version)
+    _require_operator_checkpoint_current(layer_sl_id, layer_version)
     STORE.append_pending(action, layer_sl_id, layer_version)
     return {
         "queued": True,
@@ -744,6 +835,7 @@ def _next_nonce(
 ) -> int:
     layer_sl_id, layer_version = _layer_hex(sl_id, version)
     _require_initialized(layer_sl_id, layer_version)
+    _require_operator_checkpoint_current(layer_sl_id, layer_version)
     return STORE.next_nonce(layer_sl_id, layer_version)
 
 
@@ -1880,6 +1972,7 @@ def semantic_layer_workbench_state(
     raw_batches = STORE.list_batches(layer_sl_id, layer_version) if runtime_config else []
     batches = _batches_with_evidence(raw_batches, layer_sl_id, layer_version) if runtime_config else []
     latest_batch = batches[-1] if batches else None
+    operator_checkpoint = _operator_checkpoint_status(layer_sl_id, layer_version) if runtime_config else None
     verifier_log = _verifier_store().list_verification_log(
         verifier_sl_id_bytes,
         verifier_version_bytes,
@@ -1961,6 +2054,7 @@ def semantic_layer_workbench_state(
                     "state": _state_to_response(operator_state),
                     "pending_count": len(pending_actions),
                     "next_batch_sequence": STORE.next_batch_sequence(layer_sl_id, layer_version),
+                    "checkpoint": operator_checkpoint,
                     "sl_id": layer_sl_id,
                     "version": layer_version,
                 }
@@ -1983,6 +2077,7 @@ def semantic_layer_workbench_state(
             "batches": batches,
             "latest_payload": _latest_payload_projection(latest_batch, layer_sl_id, layer_version),
             "verifier_log": verifier_log,
+            "operator_checkpoint": operator_checkpoint,
             "balances": balances,
         },
     }
@@ -2136,6 +2231,7 @@ def operator_batch(
 ) -> dict:
     with STATE_LOCK:
         layer_sl_id, layer_version = _layer_hex(sl_id, version)
+        checkpoint_status = _require_operator_checkpoint_current(layer_sl_id, layer_version)
         state = _operator_state(layer_sl_id, layer_version)
         pending_actions = STORE.load_pending(layer_sl_id, layer_version)
         if not pending_actions:
@@ -2202,6 +2298,41 @@ def operator_batch(
             "batched": True,
             "batch": record,
             "operator_state": _state_to_response(new_state),
+            "operator_checkpoint": checkpoint_status,
+            "sl_id": layer_sl_id,
+            "version": layer_version,
+        }
+
+
+@app.post("/operator/sync-from-verifier")
+def operator_sync_from_verifier(request: LayerRequest) -> dict:
+    with STATE_LOCK:
+        layer_sl_id, layer_version = _layer_hex(request.sl_id, request.version)
+        _require_initialized(layer_sl_id, layer_version)
+        checkpoint = _verifier_store().load_checkpoint(
+            bytes.fromhex(layer_sl_id),
+            bytes.fromhex(layer_version),
+        )
+        if checkpoint is None:
+            raise HTTPException(
+                status_code=404,
+                detail="no verifier checkpoint found for semantic layer",
+            )
+
+        plugin = _payment_plugin(layer_sl_id, layer_version)
+        verifier_state = plugin.state_from_dict(checkpoint["state"])
+        next_sequence = int(checkpoint["sequence"]) + 1
+        STORE.sync_operator_state_from_verifier(
+            verifier_state,
+            next_sequence,
+            layer_sl_id,
+            layer_version,
+        )
+        return {
+            "synced": True,
+            "message": "operator state synced from verifier checkpoint",
+            "operator_state": _state_to_response(verifier_state),
+            "operator_checkpoint": _operator_checkpoint_status(layer_sl_id, layer_version),
             "sl_id": layer_sl_id,
             "version": layer_version,
         }

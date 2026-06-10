@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import api  # noqa: E402
+import core  # noqa: E402
 from core import SL_ID, VERSION, hash_vk  # noqa: E402
 
 
@@ -1083,6 +1084,98 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["batches"][0]["utxo_id"], "0xutxo1")
         self.assertEqual(response.json()["batches"][0]["verification_tx_hash"], "0xtx1")
         self.assertTrue(response.json()["batches"][0]["devnet_backed"])
+
+    def test_operator_blocks_new_actions_when_verifier_checkpoint_is_ahead(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        bob = self._wallet("Bob", "bob_vk")
+
+        response = self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/verifier/accept-latest-batch")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        verifier_state = api._verified_state(SL_ID.hex(), VERSION.hex())
+        external_action = core.Action(
+            core.ActionType.TRANSFER,
+            "alice_vk",
+            2,
+            from_addr=alice["address"],
+            to=bob["address"],
+            amount=25,
+        )
+        _external_state, result = core.process_batch(
+            verifier_state,
+            [external_action],
+            sequence=2,
+            sl_id=SL_ID,
+            version=VERSION,
+        )
+        event = {
+            "cursor": "devnet:2:0:0",
+            "network_id": "devnet",
+            "height": 2,
+            "tx_hash": "0xexternal",
+            "tx_index": 0,
+            "output_index": 0,
+            "utxo_id": "0xexternal",
+            "owner": "0xmarket",
+            "amount": "1",
+            "data_scalars": api.payload_bytes_to_scalar_hex(result.data_field_payload()),
+        }
+        response = self.client.post("/verifier/ingest-event", json=event)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["accepted"])
+
+        response = self.client.get(
+            f"/semantic-layers/workbench-state?sl_id={SL_ID.hex()}&version={VERSION.hex()}"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        checkpoint = response.json()["runtime"]["operator_checkpoint"]
+        self.assertTrue(checkpoint["operator_behind_verifier"])
+        self.assertEqual(checkpoint["operator_next_sequence"], 2)
+        self.assertEqual(checkpoint["verifier_sequence"], 2)
+
+        response = self.client.post(
+            "/actions/transfer",
+            json={
+                "from_address": alice["address"],
+                "to_address": bob["address"],
+                "amount": 5,
+                "vk": "alice_vk",
+            },
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(
+            response.json()["detail"]["operator_checkpoint"]["operator_behind_verifier"],
+            True,
+        )
+
+        response = self.client.post(
+            "/operator/sync-from-verifier",
+            json={"sl_id": SL_ID.hex(), "version": VERSION.hex()},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["synced"])
+        self.assertFalse(response.json()["operator_checkpoint"]["operator_behind_verifier"])
+        self.assertEqual(response.json()["operator_checkpoint"]["operator_next_sequence"], 3)
+
+        response = self.client.post(
+            "/actions/transfer",
+            json={
+                "from_address": alice["address"],
+                "to_address": bob["address"],
+                "amount": 5,
+                "vk": "alice_vk",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["pending_count"], 1)
 
     def test_verifier_notify_catches_up_owner_stream_before_target(self):
         self._init()

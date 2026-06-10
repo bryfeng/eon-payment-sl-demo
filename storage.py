@@ -532,6 +532,26 @@ class SQLiteStorage:
             "updated_at": row["updated_at"],
         }
 
+    def sync_operator_state_from_verifier(
+        self,
+        state: core.State,
+        next_sequence: int,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> None:
+        with self.connect() as conn:
+            config = self._get_runtime_config(conn, sl_id, version)
+            self._put_scoped_state(conn, sl_id, version, "operator", state)
+            self._put_runtime_config(
+                conn,
+                sl_id,
+                version,
+                state.issuer_vk,
+                operator_wallet_address=(config or {}).get("operator_wallet_address"),
+                base_layer_account_id=(config or {}).get("base_layer_account_id"),
+                next_sequence=next_sequence,
+            )
+
     def _hydrate_runtime_metadata_from_registry(self, conn: sqlite3.Connection) -> None:
         rows = conn.execute(
             """
