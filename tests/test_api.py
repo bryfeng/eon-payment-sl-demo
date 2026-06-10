@@ -975,6 +975,235 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(spx_balance.json()["balance"], 900)
         self.assertEqual(usdc_balance.json()["balance"], 4_500)
 
+    def test_operator_execution_request_processes_pool_swap_intents(self):
+        operator = self._operator_wallet()
+        sl_id = "00010002"
+        version = VERSION.hex()
+        provider = self._wallet("Provider", "provider_vk")
+        trader = self._wallet("Trader", "trader_vk")
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Pool Assets",
+                "sl_id": sl_id,
+                "version": version,
+                "operator_wallet_address": operator["address"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post(
+            "/operator/init",
+            json={"issuer_vk": "issuer_vk", "sl_id": sl_id, "version": version},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        for asset_id in ["SPX", "USDC"]:
+            response = self.client.post(
+                f"/semantic-layers/{sl_id}/assets?version={version}",
+                json={"asset_id": asset_id, "symbol": asset_id, "name": asset_id},
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        for address, asset_id, amount in [
+            (provider["address"], "SPX", 100),
+            (provider["address"], "USDC", 5_000),
+            (trader["address"], "USDC", 1_000),
+        ]:
+            response = self.client.post(
+                "/actions/mint",
+                json={
+                    "to_address": address,
+                    "amount": amount,
+                    "asset_id": asset_id,
+                    "sl_id": sl_id,
+                    "version": version,
+                },
+            )
+            self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.post(f"/operator/batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["batch"]["applied"], 5)
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        pool_id = "pool-spx-usdc"
+
+        def signed_intents(proposal, signer_vk):
+            return [
+                {
+                    **intent,
+                    "signer_vk": signer_vk,
+                    "signature": api._demo_intent_signature(intent, signer_vk),
+                }
+                for intent in proposal["required_intents"]
+            ]
+
+        deposit_movements = [
+            {
+                "kind": "deposit",
+                "leg_id": f"{pool_id}:deposit:a",
+                "pool_id": pool_id,
+                "sl_id": sl_id,
+                "version": version,
+                "asset_id": "SPX",
+                "address": provider["address"],
+                "amount": 100,
+            },
+            {
+                "kind": "deposit",
+                "leg_id": f"{pool_id}:deposit:b",
+                "pool_id": pool_id,
+                "sl_id": sl_id,
+                "version": version,
+                "asset_id": "USDC",
+                "address": provider["address"],
+                "amount": 5_000,
+            },
+        ]
+        deposit_required = []
+        for index, movement in enumerate(deposit_movements):
+            deposit_required.append({
+                "proposal_id": "proposal-pool-deposit",
+                "action": movement["kind"],
+                "signer": provider["address"],
+                "nonce": 6 + index,
+                "asset_ref": {
+                    "sl_id": sl_id,
+                    "version": version,
+                    "asset_id": movement["asset_id"],
+                },
+                "payload": {
+                    "amount": movement["amount"],
+                    "pool_id": pool_id,
+                    "leg_id": movement["leg_id"],
+                    "address": provider["address"],
+                },
+                "expires_at_height": 100,
+            })
+        deposit_proposal = {
+            "proposal_id": "proposal-pool-deposit",
+            "kind": "add_liquidity",
+            "terms": {
+                "proposal_id": "proposal-pool-deposit",
+                "pool_id": pool_id,
+                "provider": provider["address"],
+                "amount_a": 100,
+                "amount_b": 5_000,
+                "min_lp_shares": 1,
+                "bundle_id": "11" * 32,
+                "settlement_id": "settlement-pool-deposit",
+                "height": 1,
+                "asset_movements": deposit_movements,
+            },
+            "required_intents": deposit_required,
+        }
+        response = self.client.post(
+            "/operator/execution-request",
+            json={
+                "proposal_id": deposit_proposal["proposal_id"],
+                "proposal": deposit_proposal,
+                "signed_intents": signed_intents(deposit_proposal, "provider_vk"),
+                "submit_to_base": False,
+                "wait_for_verifier": False,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["groups"][0]["batch"]["applied"], 2)
+
+        swap_movements = [
+            {
+                "kind": "swap_in",
+                "leg_id": f"{pool_id}:swap:in",
+                "pool_id": pool_id,
+                "sl_id": sl_id,
+                "version": version,
+                "asset_id": "USDC",
+                "address": trader["address"],
+                "amount": 1_000,
+            },
+            {
+                "kind": "swap_out",
+                "leg_id": f"{pool_id}:swap:out",
+                "pool_id": pool_id,
+                "sl_id": sl_id,
+                "version": version,
+                "asset_id": "SPX",
+                "address": trader["address"],
+                "amount": 16,
+            },
+        ]
+        swap_required = []
+        for index, movement in enumerate(swap_movements):
+            swap_required.append({
+                "proposal_id": "proposal-swap",
+                "action": movement["kind"],
+                "signer": trader["address"],
+                "nonce": 8 + index,
+                "asset_ref": {
+                    "sl_id": sl_id,
+                    "version": version,
+                    "asset_id": movement["asset_id"],
+                },
+                "payload": {
+                    "amount": movement["amount"],
+                    "pool_id": pool_id,
+                    "leg_id": movement["leg_id"],
+                    "address": trader["address"],
+                },
+                "expires_at_height": 100,
+            })
+        swap_proposal = {
+            "proposal_id": "proposal-swap",
+            "kind": "swap_exact_in",
+            "terms": {
+                "proposal_id": "proposal-swap",
+                "pool_id": pool_id,
+                "trader": trader["address"],
+                "input_asset": {
+                    "sl_id": sl_id,
+                    "version": version,
+                    "asset_id": "USDC",
+                },
+                "amount_in": 1_000,
+                "min_amount_out": 1,
+                "amount_out": 16,
+                "bundle_id": "22" * 32,
+                "settlement_id": "settlement-swap",
+                "height": 1,
+                "asset_movements": swap_movements,
+            },
+            "required_intents": swap_required,
+        }
+
+        response = self.client.post(
+            "/operator/execution-request",
+            json={
+                "proposal_id": swap_proposal["proposal_id"],
+                "proposal": swap_proposal,
+                "signed_intents": signed_intents(swap_proposal, "trader_vk"),
+                "submit_to_base": False,
+                "wait_for_verifier": False,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["receipt_count"], 2)
+        self.assertEqual(body["groups"][0]["batch"]["applied"], 2)
+        self.assertEqual([receipt["action"] for receipt in body["receipts"]], ["swap_in", "swap_out"])
+
+        usdc_balance = self.client.get(
+            f"/balances/{trader['address']}?source=operator&sl_id={sl_id}&version={version}&asset_id=USDC"
+        )
+        spx_balance = self.client.get(
+            f"/balances/{trader['address']}?source=operator&sl_id={sl_id}&version={version}&asset_id=SPX"
+        )
+        self.assertEqual(usdc_balance.status_code, 200, usdc_balance.text)
+        self.assertEqual(spx_balance.status_code, 200, spx_balance.text)
+        self.assertEqual(usdc_balance.json()["balance"], 0)
+        self.assertEqual(spx_balance.json()["balance"], 16)
+
     def test_semantic_layer_record_hydrates_existing_runtime_metadata(self):
         self._init()
         operator = self._operator_wallet()
