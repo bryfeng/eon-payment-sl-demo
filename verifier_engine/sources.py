@@ -73,7 +73,7 @@ class BaseLayerAPIEventSource:
             if not utxo_id:
                 continue
 
-            output_index = int(utxo.get("output_index", index))
+            output_index = self._int_field(utxo, "output_index", index)
             event_cursor = self._event_cursor(utxo, utxo_id, output_index)
             event_cursor_key = self._cursor_sort_key(event_cursor)
             if cursor_key is not None and event_cursor_key is not None and event_cursor_key <= cursor_key:
@@ -100,7 +100,7 @@ class BaseLayerAPIEventSource:
             if expected_tx_hash and utxo_tx_hash and utxo_tx_hash != expected_tx_hash:
                 continue
 
-            return self._event_from_utxo(utxo, utxo_id, int(utxo.get("output_index", index)))
+            return self._event_from_utxo(utxo, utxo_id, self._int_field(utxo, "output_index", index))
         return None
 
     def _utxos(self) -> list[dict]:
@@ -129,10 +129,10 @@ class BaseLayerAPIEventSource:
         return sorted(
             self._utxos(),
             key=lambda utxo: (
-                int(utxo.get("height", 0)),
-                int(utxo.get("tx_index", 0)),
-                int(utxo.get("output_index", 0)),
+                self._int_field(utxo, "height"),
+                self._int_field(utxo, "tx_index"),
                 self._payload_sequence(utxo),
+                self._int_field(utxo, "output_index"),
                 str(utxo.get("id") or utxo.get("utxo_id") or ""),
             ),
         )
@@ -140,10 +140,10 @@ class BaseLayerAPIEventSource:
     def _event_cursor(self, utxo: dict, utxo_id: str, output_index: int) -> str:
         return ":".join([
             self.network_id,
-            f"{int(utxo.get('height', 0)):020d}",
-            f"{int(utxo.get('tx_index', 0)):010d}",
-            f"{int(output_index):010d}",
+            f"{self._int_field(utxo, 'height'):020d}",
+            f"{self._int_field(utxo, 'tx_index'):010d}",
             f"{self._payload_sequence(utxo):020d}",
+            f"{int(output_index):010d}",
             utxo_id,
         ])
 
@@ -187,6 +187,13 @@ class BaseLayerAPIEventSource:
             return min(sequences) if sequences else 2**63 - 1
         return int.from_bytes(payload[6:14], "big")
 
+    @staticmethod
+    def _int_field(utxo: dict, key: str, default: int = 0) -> int:
+        value = utxo.get(key, default)
+        if value is None:
+            return default
+        return int(value)
+
     def _event_from_utxo(self, utxo: dict, utxo_id: str, output_index: int) -> dict:
         data_scalars = utxo.get("data") or utxo.get("data_scalars") or []
         tx_hash = str(utxo.get("tx_hash") or utxo.get("transaction_hash") or utxo_id)
@@ -194,10 +201,10 @@ class BaseLayerAPIEventSource:
             "cursor": self._event_cursor(utxo, utxo_id, output_index),
             "event_key": f"{self.network_id}:utxo:{utxo_id}:{output_index}",
             "network_id": self.network_id,
-            "height": int(utxo.get("height", 0)),
+            "height": self._int_field(utxo, "height"),
             "block_hash": utxo.get("block_hash"),
             "tx_hash": tx_hash,
-            "tx_index": int(utxo.get("tx_index", 0)),
+            "tx_index": self._int_field(utxo, "tx_index"),
             "output_index": output_index,
             "utxo_id": utxo_id,
             "owner": utxo.get("owner"),

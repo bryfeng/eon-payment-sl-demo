@@ -1747,7 +1747,7 @@ def _sync_verifier_from_base_layer_api(
     started = time.monotonic()
     deadline = started + max(0, timeout_seconds)
     attempts: list[dict] = []
-    layer_source = f"base-layer-api:{sl_id}:{version}"
+    layer_source = f"base-layer-api:v2:{sl_id}:{version}"
     checkpoint = _checkpoint_response(sl_id, version)
 
     while True:

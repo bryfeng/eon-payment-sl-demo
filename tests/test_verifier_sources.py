@@ -108,3 +108,33 @@ def test_base_layer_event_source_orders_bundle_by_child_sequence():
     utxo = {"data": payload_bytes_to_scalar_hex(bundle_payload)}
 
     assert source._payload_sequence(utxo) == 2
+
+
+def test_base_layer_event_source_cursor_uses_payload_sequence_before_output(monkeypatch):
+    source = BaseLayerAPIEventSource("https://base.example")
+    utxos = [
+        {
+            "id": "0xseq4",
+            "height": 0,
+            "tx_index": 0,
+            "output_index": 0,
+            "data": payload_bytes_to_scalar_hex(_transition_payload("00010003", 4)),
+        },
+        {
+            "id": "0xseq3",
+            "height": 0,
+            "tx_index": 0,
+            "output_index": 12,
+            "data": payload_bytes_to_scalar_hex(_transition_payload("00010003", 3)),
+        },
+    ]
+    monkeypatch.setattr(source, "_utxos", lambda: utxos)
+
+    events = list(source.events_after(None))
+    assert [event["event_key"] for event in events] == [
+        "devnet:utxo:0xseq3:12",
+        "devnet:utxo:0xseq4:0",
+    ]
+
+    after_seq3 = list(source.events_after(events[0]["cursor"]))
+    assert [event["event_key"] for event in after_seq3] == ["devnet:utxo:0xseq4:0"]
