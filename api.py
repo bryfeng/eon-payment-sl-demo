@@ -1693,6 +1693,68 @@ def _accepted_log_by_sequence(sl_id: str, version: str) -> dict[int, dict]:
     return accepted
 
 
+def _verification_log_entry_for_batch(sl_id: str, version: str, batch: dict) -> Optional[dict]:
+    entries = _verifier_store().list_verification_log(
+        bytes.fromhex(sl_id),
+        bytes.fromhex(version),
+    )
+    sequence = int(batch["sequence"])
+    prev_hash = str(batch["prev_state_hash"])
+    new_hash = str(batch["new_state_hash"])
+    matches = [
+        entry
+        for entry in entries
+        if entry.get("sequence") is not None
+        and int(entry["sequence"]) == sequence
+        and entry.get("prev_state_hash") == prev_hash
+        and entry.get("new_state_hash") == new_hash
+    ]
+    return matches[-1] if matches else None
+
+
+def _sync_operator_to_verifier_checkpoint(sl_id: str, version: str) -> Optional[dict]:
+    checkpoint = _verifier_store().load_checkpoint(
+        bytes.fromhex(sl_id),
+        bytes.fromhex(version),
+    )
+    if checkpoint is None:
+        return None
+
+    plugin = _payment_plugin(sl_id, version)
+    verifier_state = plugin.state_from_dict(checkpoint["state"])
+    next_sequence = int(checkpoint["sequence"]) + 1
+    STORE.sync_operator_state_from_verifier(
+        verifier_state,
+        next_sequence,
+        sl_id,
+        version,
+    )
+    return {
+        "synced": True,
+        "message": "operator state synced from verifier checkpoint",
+        "operator_state": _state_to_response(verifier_state),
+        "operator_checkpoint": _operator_checkpoint_status(sl_id, version),
+        "checkpoint_sequence": int(checkpoint["sequence"]),
+        "checkpoint_state_hash": checkpoint["state_hash"],
+    }
+
+
+def _rollback_operator_batch_after_rejection(sl_id: str, version: str, batch: dict) -> Optional[dict]:
+    entry = _verification_log_entry_for_batch(sl_id, version, batch)
+    if not entry or entry.get("verdict") != "rejected":
+        return None
+
+    STORE.delete_operator_batch(int(batch["sequence"]), sl_id, version)
+    sync = _sync_operator_to_verifier_checkpoint(sl_id, version)
+    return {
+        "rolled_back": True,
+        "reason": entry.get("message") or "verifier rejected operator batch",
+        "rejected_event_key": entry.get("event_key"),
+        "sequence": int(batch["sequence"]),
+        "sync": sync,
+    }
+
+
 def _batch_with_evidence(batch: dict, accepted_log: Optional[dict[int, dict]] = None) -> dict:
     record = {**batch}
     sequence = int(record["sequence"])
@@ -2857,12 +2919,20 @@ def operator_execution_request(request: OperatorExecutionRequest) -> dict:
                 timeout_seconds=request.verifier_timeout_seconds,
                 poll_interval_seconds=request.verifier_poll_interval_seconds,
             )
+            rollback = (
+                _rollback_operator_batch_after_rejection(sl_id, version, batch)
+                if verification and not verification.get("verified")
+                else None
+            )
         elif request.wait_for_verifier:
             verification = {
                 "status": "skipped",
                 "verified": False,
                 "message": "submit_to_base=false; verifier sync was not attempted",
             }
+            rollback = None
+        else:
+            rollback = None
 
         evidence_batch = _batch_with_evidence(
             batch,
@@ -2887,6 +2957,7 @@ def operator_execution_request(request: OperatorExecutionRequest) -> dict:
             "batch": evidence_batch,
             "devnet_submission": submission,
             "verification": verification,
+            "rollback": rollback,
             "receipts": group_receipts,
         })
 
@@ -2905,30 +2976,16 @@ def operator_sync_from_verifier(request: LayerRequest) -> dict:
     with STATE_LOCK:
         layer_sl_id, layer_version = _layer_hex(request.sl_id, request.version)
         _require_initialized(layer_sl_id, layer_version)
-        checkpoint = _verifier_store().load_checkpoint(
-            bytes.fromhex(layer_sl_id),
-            bytes.fromhex(layer_version),
-        )
-        if checkpoint is None:
+        synced = _sync_operator_to_verifier_checkpoint(layer_sl_id, layer_version)
+        if synced is None:
             raise HTTPException(
                 status_code=404,
                 detail="no verifier checkpoint found for semantic layer",
             )
 
-        plugin = _payment_plugin(layer_sl_id, layer_version)
-        verifier_state = plugin.state_from_dict(checkpoint["state"])
-        next_sequence = int(checkpoint["sequence"]) + 1
-        STORE.sync_operator_state_from_verifier(
-            verifier_state,
-            next_sequence,
-            layer_sl_id,
-            layer_version,
-        )
         return {
+            **synced,
             "synced": True,
-            "message": "operator state synced from verifier checkpoint",
-            "operator_state": _state_to_response(verifier_state),
-            "operator_checkpoint": _operator_checkpoint_status(layer_sl_id, layer_version),
             "sl_id": layer_sl_id,
             "version": layer_version,
         }
