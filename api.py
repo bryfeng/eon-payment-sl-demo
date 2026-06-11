@@ -557,6 +557,10 @@ def _state_to_response(state: core.State) -> dict:
             for asset_id, addresses in sorted(state.frozen_by_asset.items())
         },
     }
+    pool_escrow = {
+        pool_id: dict(sorted(balances.items()))
+        for pool_id, balances in sorted(state.pool_escrow.items())
+    }
     return {
         "issuer_vk": state.issuer_vk,
         "balances": dict(sorted(state.balances.items())),
@@ -570,6 +574,7 @@ def _state_to_response(state: core.State) -> dict:
         "balances_by_asset": balances_by_asset,
         "total_supply_by_asset": total_supply_by_asset,
         "frozen_by_asset": frozen_by_asset,
+        "pool_escrow": pool_escrow,
         "state_hash": state.state_hash(),
     }
 

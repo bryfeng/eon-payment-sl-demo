@@ -976,6 +976,13 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(spx_balance.json()["balance"], 900)
         self.assertEqual(usdc_balance.json()["balance"], 4_500)
 
+        operator_state = self.client.get(f"/operator/state?sl_id={sl_id}&version={version}")
+        self.assertEqual(operator_state.status_code, 200, operator_state.text)
+        self.assertEqual(
+            operator_state.json()["state"]["pool_escrow"],
+            {pool_id: {"SPX": 100, "USDC": 500}},
+        )
+
     def test_operator_execution_request_rolls_back_rejected_verifier_state(self):
         operator = self._operator_wallet()
         sl_id = "00010002"
