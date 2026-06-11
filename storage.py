@@ -1538,6 +1538,26 @@ class SQLiteStorage:
                     (sequence,),
                 )
 
+    def delete_operator_batches_after(
+        self,
+        sequence: int,
+        sl_id: str = core.SL_ID.hex(),
+        version: str = core.VERSION.hex(),
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                DELETE FROM sl_operator_batches
+                WHERE sl_id = ? AND version = ? AND sequence > ?
+                """,
+                (sl_id, version, sequence),
+            )
+            if sl_id == core.SL_ID.hex() and version == core.VERSION.hex():
+                conn.execute(
+                    "DELETE FROM operator_batches WHERE sequence > ?",
+                    (sequence,),
+                )
+
     def load_verified_log(self) -> list:
         with self.connect() as conn:
             rows = conn.execute(

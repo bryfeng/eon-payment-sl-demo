@@ -1729,6 +1729,7 @@ def _sync_operator_to_verifier_checkpoint(sl_id: str, version: str) -> Optional[
         sl_id,
         version,
     )
+    STORE.delete_operator_batches_after(int(checkpoint["sequence"]), sl_id, version)
     return {
         "synced": True,
         "message": "operator state synced from verifier checkpoint",
