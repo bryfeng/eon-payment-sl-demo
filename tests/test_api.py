@@ -983,6 +983,17 @@ class ApiTests(unittest.TestCase):
             {pool_id: {"SPX": 100, "USDC": 500}},
         )
 
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["accepted_sequences"], [2])
+
+        verified_state = self.client.get(f"/verifier/state?sl_id={sl_id}&version={version}")
+        self.assertEqual(verified_state.status_code, 200, verified_state.text)
+        self.assertEqual(
+            verified_state.json()["state"]["pool_escrow"],
+            {pool_id: {"SPX": 100, "USDC": 500}},
+        )
+
     def test_operator_execution_request_rolls_back_rejected_verifier_state(self):
         operator = self._operator_wallet()
         sl_id = "00010002"

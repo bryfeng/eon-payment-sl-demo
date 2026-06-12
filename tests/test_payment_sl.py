@@ -198,6 +198,7 @@ class PaymentSLTests(unittest.TestCase):
             bundle_id=bundle_id,
             child_transitions=[{"sl_id": "00040001", "actions": [{"asset_movements": movements}]}],
         )
+        amm_context = {"bundle_id": bundle_id, "asset_movements": movements}
         seeded.credit_pool_escrow(pool_id, 40, "SPX")
 
         next_state, result = process_batch(
@@ -213,6 +214,7 @@ class PaymentSLTests(unittest.TestCase):
                     trader=alice,
                     amount=100,
                     bundle_id=bundle_id,
+                    amm_context=amm_context,
                 ),
                 Action(
                     ActionType.POOL_SWAP_OUT,
@@ -224,6 +226,7 @@ class PaymentSLTests(unittest.TestCase):
                     trader=alice,
                     amount=25,
                     bundle_id=bundle_id,
+                    amm_context=amm_context,
                 ),
             ],
             context=context,
@@ -234,6 +237,8 @@ class PaymentSLTests(unittest.TestCase):
         self.assertEqual(next_state.get_pool_escrow(pool_id, "SPX"), 115)
 
         valid, msg = verify_batch(seeded, result.actions, result.new_state_hash, context=context)
+        self.assertTrue(valid, msg)
+        valid, msg = verify_batch(seeded, result.actions, result.new_state_hash)
         self.assertTrue(valid, msg)
 
     def test_pool_escrow_rejects_unmatched_amm_movement(self):

@@ -962,6 +962,29 @@ def _execution_context_from_proposal(proposal: dict[str, Any]) -> SimpleNamespac
     )
 
 
+def _action_amm_context_from_proposal(proposal: dict[str, Any]) -> dict[str, Any]:
+    terms = proposal.get("terms") or {}
+    bundle_id = str(terms.get("bundle_id") or "")
+    if not bundle_id:
+        raise HTTPException(status_code=400, detail="proposal terms missing bundle_id")
+    movements = []
+    for movement in terms.get("asset_movements") or []:
+        movements.append({
+            "kind": str(movement["kind"]),
+            "leg_id": str(movement["leg_id"]),
+            "pool_id": str(movement["pool_id"]),
+            "sl_id": str(movement["sl_id"]).lower().removeprefix("0x"),
+            "version": str(movement.get("version", core.VERSION.hex())).lower().removeprefix("0x"),
+            "asset_id": str(movement["asset_id"]),
+            "address": str(movement["address"]),
+            "amount": int(movement["amount"]),
+        })
+    return {
+        "bundle_id": bundle_id,
+        "asset_movements": movements,
+    }
+
+
 def _pool_action_from_intent(intent: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
     asset_ref = intent.get("asset_ref")
     if not asset_ref:
@@ -994,6 +1017,7 @@ def _pool_action_from_intent(intent: dict[str, Any], proposal: dict[str, Any]) -
         "leg_id": str(payload["leg_id"]),
         address_field: str(payload["address"]),
         "amount": int(payload["amount"]),
+        "amm_context": _action_amm_context_from_proposal(proposal),
     }
 
 

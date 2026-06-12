@@ -78,6 +78,27 @@ class ActionType(Enum):
 DEFAULT_ASSET_ID = "PAYMENT"
 
 
+def _normalize_amm_context(value: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if value is None:
+        return None
+    movements = []
+    for movement in value.get("asset_movements", []) or []:
+        movements.append({
+            "kind": str(movement["kind"]),
+            "leg_id": str(movement["leg_id"]),
+            "pool_id": str(movement["pool_id"]),
+            "sl_id": str(movement["sl_id"]).lower().removeprefix("0x"),
+            "version": str(movement.get("version", "0001")).lower().removeprefix("0x"),
+            "asset_id": str(movement["asset_id"]),
+            "address": str(movement["address"]),
+            "amount": int(movement["amount"]),
+        })
+    return {
+        "bundle_id": str(value["bundle_id"]),
+        "asset_movements": movements,
+    }
+
+
 @dataclass
 class Action:
     action_type: ActionType
@@ -99,6 +120,7 @@ class Action:
     owner: Optional[str] = None
     trader: Optional[str] = None
     reservation_id: Optional[str] = None
+    amm_context: Optional[dict[str, Any]] = None
 
     def serialize(self) -> bytes:
         """Compact serialization for the demo payload."""
@@ -139,6 +161,8 @@ class Action:
             payload["trader"] = self.trader
         if self.reservation_id is not None:
             payload["reservation_id"] = self.reservation_id
+        if self.amm_context is not None:
+            payload["amm_context"] = _normalize_amm_context(self.amm_context)
         return json.dumps(payload, separators=(",", ":")).encode()
 
     def to_dict(self) -> dict:
@@ -180,6 +204,8 @@ class Action:
             d["trader"] = self.trader
         if self.reservation_id is not None:
             d["reservation_id"] = self.reservation_id
+        if self.amm_context is not None:
+            d["amm_context"] = _normalize_amm_context(self.amm_context)
         return d
 
     @classmethod
@@ -204,6 +230,7 @@ class Action:
             owner=d.get("owner"),
             trader=d.get("trader"),
             reservation_id=d.get("reservation_id"),
+            amm_context=_normalize_amm_context(d.get("amm_context")),
         )
 
 
@@ -489,9 +516,30 @@ def _pool_action_address(action: Action) -> str:
     return action.trader
 
 
+def _context_value(context: Any, key: str, default: Any = None) -> Any:
+    if isinstance(context, dict):
+        return context.get(key, default)
+    return getattr(context, key, default)
+
+
 def _context_amm_movements(context: Any, pool_id: str) -> list[dict[str, Any]]:
-    transitions = getattr(context, "child_transitions", None) or []
     movements: list[dict[str, Any]] = []
+
+    for movement in _context_value(context, "asset_movements", []) or []:
+        if str(movement.get("pool_id")) != pool_id:
+            continue
+        movements.append({
+            "kind": str(movement["kind"]),
+            "leg_id": str(movement["leg_id"]),
+            "pool_id": str(movement["pool_id"]),
+            "sl_id": str(movement["sl_id"]).lower().removeprefix("0x"),
+            "version": str(movement.get("version", VERSION.hex())).lower().removeprefix("0x"),
+            "asset_id": str(movement["asset_id"]),
+            "address": str(movement["address"]),
+            "amount": int(movement["amount"]),
+        })
+
+    transitions = _context_value(context, "child_transitions", []) or []
     for transition in transitions:
         for raw_action in transition.get("actions", []):
             for movement in raw_action.get("asset_movements", []) or []:
@@ -517,9 +565,10 @@ def _require_matching_amm_movement(
     sl_id: bytes,
     version: bytes,
 ) -> None:
-    if context is None:
+    effective_context = context or action.amm_context
+    if effective_context is None:
         raise TransitionError("Pool escrow action requires bundle context")
-    bundle_id = getattr(context, "bundle_id", None)
+    bundle_id = _context_value(effective_context, "bundle_id")
     if not bundle_id or str(action.bundle_id) != str(bundle_id):
         raise TransitionError("bundle_id does not match bundle context")
     if not action.leg_id:
@@ -537,7 +586,7 @@ def _require_matching_amm_movement(
         "address": _pool_action_address(action),
         "amount": int(action.amount or 0),
     }
-    for movement in _context_amm_movements(context, str(action.pool_id)):
+    for movement in _context_amm_movements(effective_context, str(action.pool_id)):
         if movement == expected:
             return
     raise TransitionError("Pool escrow action is not authorized by AMM movement")
