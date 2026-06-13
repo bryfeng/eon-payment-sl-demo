@@ -267,7 +267,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(alice_balance["balance"], 60)
         self.assertEqual(bob_balance["balance"], 40)
 
-    def test_accept_latest_batch_catches_up_unverified_sequences(self):
+    def test_accept_latest_batch_checkpoints_each_sequence_before_next_action(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")
         bob = self._wallet("Bob", "bob_vk")
@@ -280,6 +280,11 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/operator/batch")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["batch"]["sequence"], 1)
+
+        response = self.client.post("/verifier/accept-latest-batch")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["sequence"], 1)
+        self.assertEqual(response.json()["accepted_sequences"], [1])
 
         response = self.client.post(
             "/actions/transfer",
@@ -298,7 +303,7 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/verifier/accept-latest-batch")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["sequence"], 2)
-        self.assertEqual(response.json()["accepted_sequences"], [1, 2])
+        self.assertEqual(response.json()["accepted_sequences"], [2])
 
         batches = self.client.get("/operator/batches")
         self.assertEqual(batches.status_code, 200, batches.text)
@@ -445,6 +450,8 @@ class ApiTests(unittest.TestCase):
         response = self.client.post("/operator/batch")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["batch"]["sequence"], 1)
+        response = self.client.post("/verifier/accept-latest-batch")
+        self.assertEqual(response.status_code, 200, response.text)
 
         with api.STORE.connect() as conn:
             conn.execute(
@@ -1305,6 +1312,8 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["groups"][0]["batch"]["applied"], 2)
+        response = self.client.post(f"/verifier/accept-latest-batch?sl_id={sl_id}&version={version}")
+        self.assertEqual(response.status_code, 200, response.text)
 
         swap_movements = [
             {
@@ -1653,6 +1662,69 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.json()["batches"][0]["verification_tx_hash"], "0xtx1")
         self.assertTrue(response.json()["batches"][0]["devnet_backed"])
 
+    def test_owner_filtered_verifier_sync_uses_owner_cursor(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        batch_response = self.client.post("/operator/batch")
+        self.assertEqual(batch_response.status_code, 200, batch_response.text)
+        batch = batch_response.json()["batch"]
+
+        base_url, calls = self._mock_base_layer_api()
+        os.environ["BASE_LAYER_API_URL"] = base_url
+        calls["utxos"].append(
+            {
+                "id": "0xlater",
+                "tx_hash": "0xlater",
+                "output_index": 0,
+                "amount": 1,
+                "owner": "0xother",
+                "data": ["0x00"],
+            }
+        )
+
+        response = self.client.post(
+            "/verifier/sync",
+            json={
+                "sl_id": SL_ID.hex(),
+                "version": VERSION.hex(),
+                "timeout_seconds": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        calls["utxos"].append(
+            {
+                "id": "0xutxo1",
+                "tx_hash": "0xtx1",
+                "output_index": 0,
+                "amount": batch["data_len"],
+                "owner": "0xposter",
+                "data": batch["data_scalars"],
+            }
+        )
+
+        response = self.client.post(
+            "/verifier/sync",
+            json={
+                "sl_id": SL_ID.hex(),
+                "version": VERSION.hex(),
+                "posting_owner": "0xposter",
+                "expected_sequence": batch["sequence"],
+                "expected_state_hash": batch["new_state_hash"],
+                "timeout_seconds": 0,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["verified"])
+        self.assertEqual(
+            response.json()["source"],
+            f"base-layer-api:v2:{SL_ID.hex()}:{VERSION.hex()}:owner:0xposter",
+        )
+
     def test_operator_blocks_new_actions_when_verifier_checkpoint_is_ahead(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")
@@ -1745,25 +1817,67 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["pending_count"], 1)
 
+    def test_operator_blocks_new_actions_when_unverified_batch_exists(self):
+        self._init()
+        alice = self._wallet("Alice", "alice_vk")
+        bob = self._wallet("Bob", "bob_vk")
+
+        response = self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        response = self.client.post("/operator/batch")
+        self.assertEqual(response.status_code, 200, response.text)
+
+        response = self.client.get(
+            f"/semantic-layers/workbench-state?sl_id={SL_ID.hex()}&version={VERSION.hex()}"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        checkpoint = response.json()["runtime"]["operator_checkpoint"]
+        self.assertFalse(checkpoint["current"])
+        self.assertTrue(checkpoint["checkpoint_gap"])
+        self.assertEqual(checkpoint["blocking_sequence"], 1)
+
+        response = self.client.post(
+            "/actions/transfer",
+            json={
+                "from_address": alice["address"],
+                "to_address": bob["address"],
+                "amount": 5,
+                "vk": "alice_vk",
+            },
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        detail = response.json()["detail"]["operator_checkpoint"]
+        self.assertTrue(detail["checkpoint_gap"])
+        self.assertEqual(detail["blocking_sequence"], 1)
+
     def test_verifier_notify_catches_up_owner_stream_before_target(self):
         self._init()
         alice = self._wallet("Alice", "alice_vk")
 
-        self.client.post(
-            "/actions/mint",
-            json={"to_address": alice["address"], "amount": 100},
+        state = api._operator_state(SL_ID.hex(), VERSION.hex())
+        state, result_one = core.process_batch(
+            state,
+            [core.Action(core.ActionType.MINT, "issuer_vk", 1, to=alice["address"], amount=100)],
+            sequence=1,
+            sl_id=SL_ID,
+            version=VERSION,
         )
-        batch_one_response = self.client.post("/operator/batch")
-        self.assertEqual(batch_one_response.status_code, 200, batch_one_response.text)
-        batch_one = batch_one_response.json()["batch"]
-
-        self.client.post(
-            "/actions/mint",
-            json={"to_address": alice["address"], "amount": 50},
+        self.assertFalse(result_one.rejected)
+        _state, result_two = core.process_batch(
+            state,
+            [core.Action(core.ActionType.MINT, "issuer_vk", 2, to=alice["address"], amount=50)],
+            sequence=2,
+            sl_id=SL_ID,
+            version=VERSION,
         )
-        batch_two_response = self.client.post("/operator/batch")
-        self.assertEqual(batch_two_response.status_code, 200, batch_two_response.text)
-        batch_two = batch_two_response.json()["batch"]
+        self.assertFalse(result_two.rejected)
+        scalars_one = api.payload_bytes_to_scalar_hex(result_one.data_field_payload())
+        scalars_two = api.payload_bytes_to_scalar_hex(result_two.data_field_payload())
+        batch_one = {"sequence": result_one.sequence, "data_scalars": scalars_one, "data_len": len(scalars_one)}
+        batch_two = {"sequence": result_two.sequence, "data_scalars": scalars_two, "data_len": len(scalars_two)}
 
         base_url, calls = self._mock_base_layer_api()
         calls["utxos"].extend([
@@ -1812,15 +1926,23 @@ class ApiTests(unittest.TestCase):
         self._init()
         alice = self._wallet("Alice", "alice_vk")
         batches = []
+        state = api._operator_state(SL_ID.hex(), VERSION.hex())
 
-        for amount in [100, 50, 25, 10]:
-            self.client.post(
-                "/actions/mint",
-                json={"to_address": alice["address"], "amount": amount},
+        for index, amount in enumerate([100, 50, 25, 10], start=1):
+            state, result = core.process_batch(
+                state,
+                [core.Action(core.ActionType.MINT, "issuer_vk", index, to=alice["address"], amount=amount)],
+                sequence=index,
+                sl_id=SL_ID,
+                version=VERSION,
             )
-            batch_response = self.client.post("/operator/batch")
-            self.assertEqual(batch_response.status_code, 200, batch_response.text)
-            batches.append(batch_response.json()["batch"])
+            self.assertFalse(result.rejected)
+            scalars = api.payload_bytes_to_scalar_hex(result.data_field_payload())
+            batches.append({
+                "sequence": result.sequence,
+                "data_scalars": scalars,
+                "data_len": len(scalars),
+            })
 
         def event_for(batch, index):
             return {
@@ -2057,6 +2179,8 @@ class ApiTests(unittest.TestCase):
         first_response = self.client.post("/operator/batch")
         self.assertEqual(first_response.status_code, 200, first_response.text)
         first_batch = first_response.json()["batch"]
+        response = self.client.post("/verifier/accept-latest-batch")
+        self.assertEqual(response.status_code, 200, response.text)
         self.client.post(
             "/actions/mint",
             json={"to_address": bob["address"], "amount": 50},

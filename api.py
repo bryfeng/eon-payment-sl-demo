@@ -750,6 +750,35 @@ def _operator_checkpoint_status(
         and operator_state_hash
         and verifier_state_hash != operator_state_hash
     )
+    verifier_sequence_floor = verifier_sequence if verifier_sequence is not None else 0
+    post_checkpoint_batches = [
+        batch
+        for batch in STORE.list_batches(layer_sl_id, layer_version)
+        if int(batch["sequence"]) > verifier_sequence_floor
+    ]
+
+    def batch_verified(batch: dict) -> bool:
+        verification = batch.get("verification") or {}
+        return bool(
+            batch.get("verified") is True
+            or str(batch.get("status") or "").lower() == "verified"
+            or verification.get("verified") is True
+        )
+
+    unverified_operator_batches = [
+        {
+            "sequence": int(batch["sequence"]),
+            "status": batch.get("status"),
+            "verified": batch_verified(batch),
+            "submitted": bool(batch.get("devnet_submission")),
+            "devnet_backed": bool(batch.get("devnet_submission") or batch.get("event_key")),
+            "new_state_hash": batch.get("new_state_hash"),
+        }
+        for batch in post_checkpoint_batches
+        if not batch_verified(batch)
+    ]
+    checkpoint_gap = bool(unverified_operator_batches)
+    blocking_batch = unverified_operator_batches[0] if unverified_operator_batches else None
     operator_last_sequence = (
         operator_next_sequence - 1
         if operator_next_sequence is not None
@@ -771,6 +800,11 @@ def _operator_checkpoint_status(
             "operator state conflicts with verifier checkpoint at the same sequence; "
             "sync operator from verifier before accepting new semantic-layer actions"
         )
+    elif blocking_batch is not None:
+        message = (
+            f"operator has unverified batch #{blocking_batch['sequence']}; "
+            "submit and verify it before accepting new semantic-layer actions"
+        )
     elif state_hash_mismatch:
         message = "operator has local state not yet matched by verifier checkpoint"
     elif checkpoint is not None:
@@ -779,9 +813,13 @@ def _operator_checkpoint_status(
         message = "no verifier checkpoint exists yet"
 
     return {
-        "current": not operator_behind and not operator_conflict,
+        "current": not operator_behind and not operator_conflict and not checkpoint_gap,
         "operator_behind_verifier": operator_behind,
         "operator_conflicts_verifier": operator_conflict,
+        "checkpoint_gap": checkpoint_gap,
+        "blocking_sequence": blocking_batch["sequence"] if blocking_batch is not None else None,
+        "blocking_status": blocking_batch["status"] if blocking_batch is not None else None,
+        "unverified_operator_batches": unverified_operator_batches,
         "state_hash_mismatch": state_hash_mismatch,
         "operator_next_sequence": operator_next_sequence,
         "operator_last_sequence": operator_last_sequence,
@@ -1846,6 +1884,8 @@ def _sync_verifier_from_base_layer_api(
     deadline = started + max(0, timeout_seconds)
     attempts: list[dict] = []
     layer_source = f"base-layer-api:v2:{sl_id}:{version}"
+    if posting_owner:
+        layer_source = f"{layer_source}:owner:{posting_owner.lower()}"
     checkpoint = _checkpoint_response(sl_id, version)
 
     while True:
@@ -2464,6 +2504,11 @@ def register_semantic_layer(request: SemanticLayerRequest) -> dict:
             if "assets" in fields_set
             else list((previous_record or {}).get("assets", []))
         )
+        new_assets = [
+            asset for asset in assets if asset["asset_id"] not in previous_asset_ids
+        ]
+        if new_assets and _initialized(sl_id, version):
+            _require_operator_checkpoint_current(sl_id, version)
         record = {
             "name": request.name.strip(),
             "sl_id": sl_id,
@@ -2497,6 +2542,13 @@ def register_semantic_layer_asset(
         layer_sl_id = _sl_id_bytes(sl_id).hex()
         layer_version = _version_hex(version)
         asset = _asset_to_record(request)
+        operator_state = STORE.load_operator_state(layer_sl_id, layer_version)
+        if (
+            _initialized(layer_sl_id, layer_version)
+            and operator_state is not None
+            and not operator_state.asset_record(asset["asset_id"])
+        ):
+            _require_operator_checkpoint_current(layer_sl_id, layer_version)
         try:
             record = STORE.append_semantic_layer_asset(layer_sl_id, layer_version, asset)
         except KeyError as e:
