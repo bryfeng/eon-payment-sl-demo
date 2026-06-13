@@ -948,6 +948,24 @@ class ApiTests(unittest.TestCase):
             "required_intents": required_intents,
         }
 
+        incomplete_proposal = json.loads(json.dumps(proposal))
+        del incomplete_proposal["terms"]["asset_movements"]
+        response = self.client.post(
+            "/operator/execution-request",
+            json={
+                "proposal_id": proposal_id,
+                "proposal": incomplete_proposal,
+                "signed_intents": signed_intents,
+                "submit_to_base": False,
+                "wait_for_verifier": False,
+            },
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(
+            response.json()["detail"],
+            "proposal terms missing asset_movements for pool escrow replay",
+        )
+
         response = self.client.post(
             "/operator/execution-request",
             json={
@@ -964,6 +982,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(body["receipt_count"], 2)
         self.assertEqual(body["groups"][0]["batch"]["applied"], 2)
         self.assertFalse(body["receipts"][0]["accepted"])
+        applied_actions = body["groups"][0]["batch"]["actions_applied"]
+        self.assertTrue(all("amm_context" in action for action in applied_actions))
+        self.assertEqual(applied_actions[0]["amm_context"]["asset_movements"], movements)
+        self.assertIn("616d6d5f636f6e74657874", body["groups"][0]["batch"]["payload_hex"])
 
         spx_balance = self.client.get(
             f"/balances/{provider['address']}?source=operator&sl_id={sl_id}&version={version}&asset_id=SPX"

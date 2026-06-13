@@ -967,8 +967,14 @@ def _action_amm_context_from_proposal(proposal: dict[str, Any]) -> dict[str, Any
     bundle_id = str(terms.get("bundle_id") or "")
     if not bundle_id:
         raise HTTPException(status_code=400, detail="proposal terms missing bundle_id")
+    raw_movements = terms.get("asset_movements") or []
+    if not raw_movements:
+        raise HTTPException(
+            status_code=400,
+            detail="proposal terms missing asset_movements for pool escrow replay",
+        )
     movements = []
-    for movement in terms.get("asset_movements") or []:
+    for movement in raw_movements:
         movements.append({
             "kind": str(movement["kind"]),
             "leg_id": str(movement["leg_id"]),
