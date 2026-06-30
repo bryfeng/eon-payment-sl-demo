@@ -31,8 +31,10 @@ from account_vault import (
 import core
 from devnet_adapter import envelope_from_payload_hex
 from devnet_submitter import (
+    DevnetSubmitConfig,
     DevnetSubmitError,
     devnet_status as command_devnet_status,
+    submit_operator_signed_batch,
     submit_batch_to_devnet,
 )
 from payment_plugin import PAYMENT_PLUGIN, PaymentSLPlugin, payment_plugin_for
@@ -174,9 +176,26 @@ class DevnetSubmitRequest(BaseModel):
     sequence: Optional[int] = Field(default=None, ge=1)
     sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
     version: str = Field(default=core.VERSION.hex(), min_length=1)
+    posting_mode: Literal["hosted_poster", "operator_signed"] = "hosted_poster"
+    signed_transaction: Optional[str] = None
+    tx_hash: Optional[str] = None
+    payload_hash: Optional[str] = None
+    recipient: Optional[str] = None
+    amount: Optional[int] = Field(default=None, gt=0)
+    fee: Optional[int] = Field(default=None, ge=0)
+    output_index: int = Field(default=0, ge=0)
     wait_for_verifier: bool = True
     verifier_timeout_seconds: int = Field(default=120, ge=0, le=300)
     verifier_poll_interval_seconds: float = Field(default=5, gt=0, le=30)
+
+
+class DevnetSigningRequest(BaseModel):
+    sequence: Optional[int] = Field(default=None, ge=1)
+    sl_id: str = Field(default=core.SL_ID.hex(), min_length=1)
+    version: str = Field(default=core.VERSION.hex(), min_length=1)
+    recipient: Optional[str] = None
+    amount: Optional[int] = Field(default=None, gt=0)
+    fee: Optional[int] = Field(default=None, ge=0)
 
 
 class VerifierSyncRequest(BaseModel):
@@ -1167,6 +1186,124 @@ def _batch_for_submission(
     raise HTTPException(status_code=404, detail=f"operator batch {sequence} not found")
 
 
+def _payload_hash(batch: dict) -> str:
+    return "0x" + hashlib.sha256(bytes.fromhex(str(batch["payload_hex"]))).hexdigest()
+
+
+def _validate_hex_field(value: str, field_name: str) -> str:
+    text = value.strip().lower()
+    raw = text[2:] if text.startswith("0x") else text
+    if not raw:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required")
+    try:
+        bytes.fromhex(raw)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be hex") from e
+    return f"0x{raw}"
+
+
+def _env_int_any(names: tuple[str, ...], default: int) -> int:
+    for name in names:
+        value = os.environ.get(name)
+        if not value or not value.strip():
+            continue
+        try:
+            parsed = int(value)
+        except ValueError:
+            continue
+        if parsed >= 0:
+            return parsed
+    return default
+
+
+def _operator_posting_recipient(
+    sl_id: str,
+    version: str,
+    explicit_recipient: Optional[str] = None,
+) -> str:
+    if explicit_recipient:
+        return _validate_eon_address(explicit_recipient)
+
+    record = _active_semantic_layer_record(sl_id, version)
+    runtime_config = _active_runtime_config(sl_id, version)
+    account = _resolved_base_layer_account(record, runtime_config)
+    if account and account.get("eon_address"):
+        return _validate_eon_address(str(account["eon_address"]))
+
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            "operator_signed posting requires recipient or a semantic-layer "
+            "base_layer_account_id with an eon_address"
+        ),
+    )
+
+
+def _operator_signing_request(
+    *,
+    batch: dict,
+    sl_id: str,
+    version: str,
+    recipient: Optional[str] = None,
+    amount: Optional[int] = None,
+    fee: Optional[int] = None,
+) -> dict:
+    config = DevnetSubmitConfig.from_env()
+    data_scalars = batch.get("data_scalars") or payload_bytes_to_scalar_hex(
+        bytes.fromhex(str(batch["payload_hex"]))
+    )
+    data_len = len(data_scalars)
+    resolved_recipient = _operator_posting_recipient(sl_id, version, recipient)
+    resolved_amount = amount or _env_int_any(
+        ("BASE_LAYER_TRANSFER_AMOUNT", "EON_BASE_LAYER_TRANSFER_AMOUNT"),
+        max(1, data_len),
+    )
+    if resolved_amount <= 0:
+        resolved_amount = max(1, data_len)
+    resolved_fee = fee if fee is not None else _env_int_any(
+        ("OPERATOR_SIGNED_TRANSFER_FEE", "BASE_LAYER_TRANSFER_FEE", "EON_BASE_LAYER_TRANSFER_FEE"),
+        1,
+    )
+    record = _active_semantic_layer_record(sl_id, version)
+    runtime_config = _active_runtime_config(sl_id, version)
+    operator_wallet_address = (
+        (record or {}).get("operator_wallet_address")
+        or (runtime_config or {}).get("operator_wallet_address")
+    )
+    batch_payload_hash = _payload_hash(batch)
+
+    return {
+        "posting_mode": "operator_signed",
+        "network_id": "devnet",
+        "api_url": config.api_url,
+        "sl_id": sl_id,
+        "version": version,
+        "sequence": int(batch["sequence"]),
+        "operator_wallet_address": operator_wallet_address,
+        "recipient": resolved_recipient,
+        "amount": resolved_amount,
+        "fee": resolved_fee,
+        "payload_hex": batch["payload_hex"],
+        "payload_hash": batch_payload_hash,
+        "payload_size": batch["payload_size"],
+        "data_scalars": data_scalars,
+        "data_len": data_len,
+        "expected_state_hash": batch["new_state_hash"],
+        "signing_payload": {
+            "domain": "IOVI_PAYMENT_SL_OPERATOR_SIGNED_TX_V1",
+            "network_id": "devnet",
+            "api_url": config.api_url,
+            "sl_id": sl_id,
+            "version": version,
+            "sequence": int(batch["sequence"]),
+            "payload_hash": batch_payload_hash,
+            "recipient": resolved_recipient,
+            "amount": resolved_amount,
+            "fee": resolved_fee,
+        },
+    }
+
+
 def _commit_operator_action_batch(
     *,
     actions: list[dict[str, Any]],
@@ -1335,6 +1472,71 @@ def _submit_operator_batch_to_devnet(
             )
 
         submission = submit_batch_to_devnet(batch, _submission_account_json(sl_id, version))
+        updated_batch = STORE.record_devnet_submission(
+            batch["sequence"],
+            submission,
+            sl_id,
+            version,
+        )
+    except DevnetSubmitError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    return submission, updated_batch
+
+
+def _submit_operator_signed_batch_to_devnet(
+    *,
+    batch: dict,
+    sl_id: str,
+    version: str,
+    request: DevnetSubmitRequest,
+) -> tuple[dict, dict]:
+    existing = batch.get("devnet_submission")
+    if existing and existing.get("status") == "submitted" and not request.force:
+        raise HTTPException(
+            status_code=409,
+            detail=f"batch {batch['sequence']} is already submitted to devnet; pass force=true to resubmit",
+        )
+
+    signing_request = _operator_signing_request(
+        batch=batch,
+        sl_id=sl_id,
+        version=version,
+        recipient=request.recipient,
+        amount=request.amount,
+        fee=request.fee,
+    )
+    if request.payload_hash:
+        supplied_hash = _validate_hex_field(request.payload_hash, "payload_hash")
+        if supplied_hash != signing_request["payload_hash"]:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": "payload_hash does not match the selected operator batch",
+                    "expected_payload_hash": signing_request["payload_hash"],
+                    "supplied_payload_hash": supplied_hash,
+                },
+            )
+    if not request.signed_transaction or not request.tx_hash:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "operator_signed posting requires signed_transaction and tx_hash",
+                "signing_request": signing_request,
+            },
+        )
+
+    try:
+        submission = submit_operator_signed_batch(
+            batch,
+            signed_transaction=request.signed_transaction,
+            tx_hash=_validate_hex_field(request.tx_hash, "tx_hash"),
+            owner=signing_request["recipient"],
+            amount=int(signing_request["amount"]),
+            output_index=request.output_index,
+        )
+        submission["payload_hash"] = signing_request["payload_hash"]
         updated_batch = STORE.record_devnet_submission(
             batch["sequence"],
             submission,
@@ -3130,6 +3332,21 @@ def encode_payload(request: PayloadRequest) -> dict:
     }
 
 
+@app.post("/devnet/operator-signing-request")
+def operator_signing_request(request: DevnetSigningRequest) -> dict:
+    with STATE_LOCK:
+        sl_id, version = _layer_hex(request.sl_id, request.version)
+        batch = _batch_for_submission(sl_id, version, request.sequence)
+        return _operator_signing_request(
+            batch=batch,
+            sl_id=sl_id,
+            version=version,
+            recipient=request.recipient,
+            amount=request.amount,
+            fee=request.fee,
+        )
+
+
 @app.get("/devnet/status")
 def get_devnet_status(
     sl_id: Optional[str] = Query(default=None),
@@ -3143,12 +3360,20 @@ def submit_latest_batch_to_devnet(request: DevnetSubmitRequest) -> dict:
     with STATE_LOCK:
         sl_id, version = _layer_hex(request.sl_id, request.version)
         batch = _batch_for_submission(sl_id, version, request.sequence)
-        submission, updated_batch = _submit_operator_batch_to_devnet(
-            batch=batch,
-            sl_id=sl_id,
-            version=version,
-            force=request.force,
-        )
+        if request.posting_mode == "operator_signed":
+            submission, updated_batch = _submit_operator_signed_batch_to_devnet(
+                batch=batch,
+                sl_id=sl_id,
+                version=version,
+                request=request,
+            )
+        else:
+            submission, updated_batch = _submit_operator_batch_to_devnet(
+                batch=batch,
+                sl_id=sl_id,
+                version=version,
+                force=request.force,
+            )
 
     verification, updated_batch = _verify_submitted_operator_batch(
         batch=updated_batch,

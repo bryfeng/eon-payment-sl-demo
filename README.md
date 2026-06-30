@@ -109,35 +109,59 @@ eoncli list-utxo <operator-address>
 eoncli get-vk operator.pk
 ```
 
-The hosted API can submit the latest batch to live devnet when a submitter
-command is configured:
+The most realistic devnet loop is operator-signed posting: the API prepares the
+canonical batch payload, the operator signs an EON transaction locally, and the
+API only relays the already-signed transaction.
 
 ```bash
-export EON_DEVNET_API_URL=https://eon.zk524.com
+curl -sS -X POST "$PAYMENT_SL_API/devnet/operator-signing-request" \
+  -H 'content-type: application/json' \
+  -d '{"sl_id":"00010001","version":"0001"}' > signing-request.json
+
+local-eon-signer < signing-request.json > signed-tx.json
+
+curl -sS -X POST "$PAYMENT_SL_API/devnet/submit-latest-batch" \
+  -H 'content-type: application/json' \
+  -d "$(jq '. + {posting_mode:"operator_signed", wait_for_verifier:false}' signed-tx.json)"
+```
+
+The wallet in `EON_OPERATOR_WALLET_FILE` stays local and pays the base-layer
+posting fee. The hosted API never reads that key in `operator_signed` mode.
+
+The hosted API can still submit through the base-layer API when
+`BASE_LAYER_API_URL` is configured, or through a legacy submitter command:
+
+```bash
+export BASE_LAYER_API_URL=https://iovi-api-production.up.railway.app
+# Optional when the base-layer API requires poster auth:
+export BASE_LAYER_API_KEY=poster-secret
+export EON_DEVNET_API_URL=https://eon.zk524.com/dev
 export EON_DEVNET_SUBMIT_CMD="/path/to/eon-devnet-submit"
 export EON_KEY_ENCRYPTION_SECRET="long random deployment secret"
 ```
 
 `POST /devnet/submit-latest-batch` sends the latest `payload_hex` and
-`data_scalars` to that command over stdin. The command signs and submits the
-data-bearing transaction, then returns JSON with at least `tx_hash`. Operator
-EON account JSON is stored encrypted in SQLite and bound to semantic-layer
-registry records, so each operator can post with its own base-layer account.
-Without `EON_DEVNET_SUBMIT_CMD` and a bound base-layer account, the API reports
-devnet submission as unconfigured instead of pretending that local scalar
-encoding wrote to the base layer.
+`data_scalars` to that command over stdin in hosted-poster mode. The command
+signs and submits the data-bearing transaction, then returns JSON with at least
+`tx_hash`. Operator EON account JSON is stored encrypted in SQLite and bound to
+semantic-layer registry records, so each operator can post with its own
+base-layer account.
+Without `BASE_LAYER_API_URL` or `EON_DEVNET_SUBMIT_CMD` and a bound base-layer
+account, the API reports devnet submission as unconfigured instead of pretending
+that local scalar encoding wrote to the base layer.
 
 `POST /base-layer/accounts/generate` provisions a base-layer account for a
 registered user, SL operator, coordinator, or verifier wallet and stores the
 signing material encrypted for later submission. User accounts use
 `purpose=user_wallet`; SL operator posting accounts use `purpose=sl_operator`.
 
-For local workspace testing with the sibling `eon-sdk` checkout, the command can
-point at the generic submitter example:
+For local workspace testing, point `EON_DEVNET_SUBMIT_CMD` at a compatible
+submitter command that reads the JSON payload from stdin and returns at least
+`tx_hash`:
 
 ```bash
 export EON_OPERATOR_WALLET_FILE=/path/to/operator_key.json
-export EON_DEVNET_SUBMIT_CMD="cargo run --quiet --manifest-path /path/to/eon-sdk/Cargo.toml --example post_payment_sl_payload"
+export EON_DEVNET_SUBMIT_CMD="/path/to/eon-devnet-submit"
 ```
 
 `EON_OPERATOR_WALLET_FILE` is still supported as a local fallback. The hosted

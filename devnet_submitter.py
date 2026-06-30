@@ -22,7 +22,7 @@ from typing import Any, Optional
 from verifier_engine.eon_data import payload_bytes_to_scalar_hex, payload_hex_to_bytes
 
 
-DEFAULT_DEVNET_API_URL = "https://eon.zk524.com"
+DEFAULT_DEVNET_API_URL = "https://eon.zk524.com/dev"
 
 
 class DevnetSubmitError(RuntimeError):
@@ -333,6 +333,109 @@ def submit_batch_to_devnet(
         "data_len": data_len,
         "data_scalars": data_scalars,
     }
+
+
+def submit_operator_signed_batch(
+    batch: dict,
+    *,
+    signed_transaction: str,
+    tx_hash: str,
+    owner: str,
+    amount: int,
+    output_index: int = 0,
+) -> dict:
+    config = DevnetSubmitConfig.from_env()
+    normalized_tx = normalize_signed_transaction(signed_transaction)
+    tx_hash = tx_hash.strip()
+    if not tx_hash:
+        raise DevnetSubmitError("operator-signed submission requires tx_hash")
+
+    response = submit_signed_transaction_to_devnet(
+        normalized_tx,
+        api_url=config.api_url,
+        timeout_seconds=config.timeout_seconds,
+    )
+    data_scalars = submission_data_scalars(batch)
+
+    return {
+        "status": "submitted",
+        "network_id": "devnet",
+        "api_url": config.api_url,
+        "submitter": "operator_signed",
+        "sequence": batch["sequence"],
+        "tx_hash": tx_hash,
+        "utxo_id": None,
+        "spent_utxo": None,
+        "owner": owner,
+        "output_index": output_index,
+        "amount": str(amount),
+        "response": response,
+        "payload_hex": batch["payload_hex"],
+        "data_len": len(data_scalars),
+        "data_scalars": data_scalars,
+    }
+
+
+def submit_signed_transaction_to_devnet(
+    signed_transaction: str,
+    *,
+    api_url: Optional[str] = None,
+    timeout_seconds: Optional[int] = None,
+) -> Any:
+    config = DevnetSubmitConfig.from_env()
+    url = api_url or config.api_url
+    timeout = timeout_seconds or config.timeout_seconds
+    body = {
+        "jsonrpc": "2.0",
+        "method": "submit_transaction",
+        "params": {"tx": normalize_signed_transaction(signed_transaction)},
+        "id": "operator-signed-submit",
+    }
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace").strip()
+        raise DevnetSubmitError(
+            f"EON JSON-RPC submit_transaction failed with HTTP {e.code}: {detail}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise DevnetSubmitError(f"EON JSON-RPC submit_transaction failed: {e}") from e
+    except TimeoutError as e:
+        raise DevnetSubmitError("EON JSON-RPC submit_transaction timed out") from e
+
+    try:
+        parsed = json.loads(response_body)
+    except json.JSONDecodeError as e:
+        raise DevnetSubmitError("EON JSON-RPC submit_transaction did not return JSON") from e
+    if not isinstance(parsed, dict):
+        raise DevnetSubmitError("EON JSON-RPC submit_transaction returned non-object JSON")
+    if parsed.get("error"):
+        raise DevnetSubmitError(f"EON JSON-RPC error: {parsed['error']}")
+    if parsed.get("jsonrpc") != "2.0":
+        raise DevnetSubmitError("EON JSON-RPC response missing jsonrpc=2.0")
+    if parsed.get("id") != body["id"]:
+        raise DevnetSubmitError("EON JSON-RPC response id mismatch")
+    return parsed.get("result")
+
+
+def normalize_signed_transaction(signed_transaction: str) -> str:
+    value = signed_transaction.strip().lower()
+    raw = value[2:] if value.startswith("0x") else value
+    if not raw:
+        raise DevnetSubmitError("signed_transaction is required")
+    try:
+        bytes.fromhex(raw)
+    except ValueError as e:
+        raise DevnetSubmitError("signed_transaction must be hex") from e
+    return f"0x{raw}"
 
 
 def submit_batch_via_base_layer_api(

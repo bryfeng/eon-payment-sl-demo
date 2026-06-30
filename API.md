@@ -106,6 +106,7 @@ POST /operator/sync-from-verifier
 GET /operator/batches
 GET /operator/latest-payload
 POST /devnet/encode-payload
+POST /devnet/operator-signing-request
 GET /devnet/status
 POST /devnet/submit-latest-batch
 GET /verifier/state
@@ -487,6 +488,7 @@ the plugin-indexed verified state and log.
 
 ```http
 POST /devnet/encode-payload
+POST /devnet/operator-signing-request
 GET /devnet/status
 POST /devnet/submit-latest-batch
 ```
@@ -507,7 +509,7 @@ Request:
 ```json
 {
   "network_id": "devnet",
-  "api_url": "https://eon.zk524.com",
+  "api_url": "https://eon.zk524.com/dev",
   "submitter": "command",
   "submitter_configured": true,
   "account_generator": "configured",
@@ -519,12 +521,48 @@ Request:
 }
 ```
 
-`POST /devnet/submit-latest-batch` submits the latest operator batch through the
-configured base-layer API or legacy submitter command and persists the returned
-transaction metadata on the batch record. By default it then triggers a bounded
-verifier sync: poll every `5` seconds for up to `120` seconds, ending early once
-the verifier checkpoint reaches the submitted batch sequence and state hash.
-Pass `wait_for_verifier: false` to return immediately after submission.
+`POST /devnet/operator-signing-request` returns the exact payload and transaction
+hints an operator needs to sign locally:
+
+```json
+{
+  "posting_mode": "operator_signed",
+  "api_url": "https://eon.zk524.com/dev",
+  "sl_id": "00010001",
+  "version": "0001",
+  "sequence": 8,
+  "recipient": "0x...",
+  "amount": 12,
+  "fee": 1,
+  "payload_hash": "0x...",
+  "data_scalars": ["0x..."]
+}
+```
+
+The recipient defaults to the semantic layer's bound base-layer account
+`eon_address`. If no recipient or bound base-layer account exists, the API
+returns `409` instead of falling back to a hosted poster.
+
+`POST /devnet/submit-latest-batch` supports two posting modes. The default
+`hosted_poster` mode submits through the configured base-layer API or legacy
+submitter command and persists the returned transaction metadata on the batch
+record. `operator_signed` mode requires `signed_transaction` and `tx_hash`; the
+API relays that already-authorized transaction directly to EON JSON-RPC
+`submit_transaction` and never loads a hosted env wallet.
+
+```json
+{
+  "posting_mode": "operator_signed",
+  "signed_transaction": "0x...",
+  "tx_hash": "0x...",
+  "payload_hash": "0x..."
+}
+```
+
+By default submission then triggers a bounded verifier sync: poll every `5`
+seconds for up to `120` seconds, ending early once the verifier checkpoint
+reaches the submitted batch sequence and state hash. Pass
+`wait_for_verifier: false` to return immediately after submission.
 Batch records expose a top-level lifecycle `status`: `batched` before base-layer
 submission, `submitted` after a tx hash is stored, `verified` after verifier
 checkpoint acceptance, or `verification_timeout` when the bounded verifier sync
@@ -554,11 +592,12 @@ The API returns `503` when no live submitter or bound base-layer account is
 configured. This is deliberate: encoding a devnet-ready payload is not the same
 thing as writing it to devnet.
 
-For the local sibling `eon-sdk` checkout, `examples/post_payment_sl_payload.rs`
-implements this command protocol and posts the scalar data through EON JSON-RPC
-`submit_transaction` using `EON_OPERATOR_WALLET_FILE`. The file env remains the
-submitter boundary, but the hosted workbench should populate it from encrypted
-SQLite account records instead of a global Railway file.
+For local command-based testing, point `EON_DEVNET_SUBMIT_CMD` at a compatible
+submitter that implements this stdin/stdout protocol and posts scalar data
+through EON JSON-RPC `submit_transaction` using `EON_OPERATOR_WALLET_FILE`.
+The file env remains the submitter boundary, but the hosted workbench should
+populate it from encrypted SQLite account records instead of a global Railway
+file. Prefer the configured base-layer API path for hosted deployments.
 
 ## Suggested Demo Flow
 

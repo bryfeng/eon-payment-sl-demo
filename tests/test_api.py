@@ -184,6 +184,45 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(cleanup)
         return f"http://127.0.0.1:{server.server_port}", calls
 
+    def _mock_eon_rpc(self):
+        calls = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                return
+
+            def _send_json(self, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                content_length = int(self.headers.get("content-length", "0"))
+                body = json.loads(self.rfile.read(content_length).decode("utf-8"))
+                calls.append(body)
+                self._send_json(
+                    200,
+                    {
+                        "jsonrpc": "2.0",
+                        "id": body.get("id"),
+                        "result": "ok",
+                    },
+                )
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def cleanup():
+            server.shutdown()
+            server.server_close()
+
+        self.addCleanup(cleanup)
+        return f"http://127.0.0.1:{server.server_port}", calls
+
     def test_root_liveness_message(self):
         response = self.client.get("/")
 
@@ -2095,6 +2134,119 @@ class ApiTests(unittest.TestCase):
         response = self.client.get(f"/verifier/state?sl_id={SL_ID.hex()}&version=0001")
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["state"]["state_hash"], batch["new_state_hash"])
+
+    def test_operator_signing_request_uses_bound_base_layer_account(self):
+        self._init()
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+        response = self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": operator["address"],
+                "base_layer_account_id": base_account["id"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        batch_response = self.client.post("/operator/batch")
+        self.assertEqual(batch_response.status_code, 200, batch_response.text)
+        batch = batch_response.json()["batch"]
+
+        response = self.client.post("/devnet/operator-signing-request", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        signing_request = response.json()
+        self.assertEqual(signing_request["posting_mode"], "operator_signed")
+        self.assertEqual(signing_request["recipient"], base_account["eon_address"])
+        self.assertEqual(signing_request["amount"], batch["data_len"])
+        self.assertEqual(signing_request["fee"], 1)
+        self.assertEqual(signing_request["data_scalars"], batch["data_scalars"])
+        self.assertEqual(signing_request["signing_payload"]["payload_hash"], signing_request["payload_hash"])
+        self.assertEqual(signing_request["signing_payload"]["sequence"], batch["sequence"])
+
+    def test_operator_signed_submission_requires_signed_transaction(self):
+        self._init()
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+        self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": operator["address"],
+                "base_layer_account_id": base_account["id"],
+            },
+        )
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.client.post("/operator/batch")
+
+        response = self.client.post(
+            "/devnet/submit-latest-batch",
+            json={"posting_mode": "operator_signed"},
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        detail = response.json()["detail"]
+        self.assertIn("requires signed_transaction", detail["message"])
+        self.assertEqual(detail["signing_request"]["recipient"], base_account["eon_address"])
+
+    def test_operator_signed_submission_broadcasts_signed_tx_without_poster(self):
+        self._init()
+        operator = self._operator_wallet()
+        base_account = self._base_layer_account(operator)
+        self.client.post(
+            "/semantic-layers",
+            json={
+                "name": "Payment SL",
+                "sl_id": SL_ID.hex(),
+                "version": "0001",
+                "operator_wallet_address": operator["address"],
+                "base_layer_account_id": base_account["id"],
+            },
+        )
+        alice = self._wallet("Alice", "alice_vk")
+        self.client.post(
+            "/actions/mint",
+            json={"to_address": alice["address"], "amount": 100},
+        )
+        self.client.post("/operator/batch")
+
+        rpc_url, calls = self._mock_eon_rpc()
+        os.environ["EON_DEVNET_API_URL"] = rpc_url
+        signing = self.client.post("/devnet/operator-signing-request", json={}).json()
+
+        response = self.client.post(
+            "/devnet/submit-latest-batch",
+            json={
+                "posting_mode": "operator_signed",
+                "signed_transaction": "0xabcd",
+                "tx_hash": "0x" + "1" * 64,
+                "payload_hash": signing["payload_hash"],
+                "wait_for_verifier": False,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["method"], "submit_transaction")
+        self.assertEqual(calls[0]["params"]["tx"], "0xabcd")
+
+        submission = response.json()["devnet_submission"]
+        self.assertEqual(submission["submitter"], "operator_signed")
+        self.assertEqual(submission["tx_hash"], "0x" + "1" * 64)
+        self.assertEqual(submission["owner"], base_account["eon_address"])
+        self.assertEqual(submission["payload_hash"], signing["payload_hash"])
+        self.assertEqual(response.json()["batch"]["status"], "submitted")
 
     def test_devnet_submission_verifies_manifest_asset_genesis(self):
         operator = self._operator_wallet()
